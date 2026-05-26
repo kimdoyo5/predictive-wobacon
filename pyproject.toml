@@ -1,0 +1,14 @@
+[project]
+name = "predictive-wobacon"
+version = "0.1.0"
+description = "Per-pitch (EV, LA) -> next-year pitcher xwOBAcon model (50/50 splines+LGBM ensemble)"
+requires-python = ">=3.11"
+dependencies = [
+    "polars>=1.0",
+    "numpy>=1.26",
+    "scipy>=1.13",
+    "scikit-learn>=1.5",
+    "lightgbm>=4.0",
+    "matplotlib>=3.8",
+    "requests>=2.31",
+]

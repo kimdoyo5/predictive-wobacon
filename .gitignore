@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# data + outputs
+data/
+artifacts/
+
+# uv lock — opt back in if you want pinned deps in version control
+uv.lock
+
+# editors / OS / tooling
+.vscode/
+.idea/
+.claude/
+.DS_Store
+Thumbs.db
