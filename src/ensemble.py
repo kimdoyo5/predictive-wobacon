@@ -236,7 +236,7 @@ def render_heatmap(spline_res, lgbm_res, out_path: Path, which: str = "ensemble"
     mask = Hgrid < max(1, H.sum() * 1e-6)
     pred_m = np.ma.array(pred, mask=mask)
 
-    fig, ax = plt.subplots(figsize=(10, 7), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(8, 6.3), constrained_layout=True)
     league_xwobacon = 0.371
     half_range = 0.2
     vmin = league_xwobacon - half_range
@@ -245,13 +245,15 @@ def render_heatmap(spline_res, lgbm_res, out_path: Path, which: str = "ensemble"
     cmap = plt.get_cmap("RdBu_r").copy(); cmap.set_bad("#dddddd")
     im = ax.pcolormesh(EV, LA, pred_m, shading="auto", cmap=cmap, norm=norm)
     cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("predicted next-year pitcher xwOBAcon")
+    cbar.set_label("predicted next-year pitcher xwOBAcon", fontsize=14)
     cbar.ax.yaxis.set_major_locator(MultipleLocator(0.05))
-    ax.set_xlabel("Exit velocity (mph)")
-    ax.set_ylabel("Launch angle (°)")
-    ax.set_title(f"Pitcher-year predictive xwOBAcon: {title_model}")
+    cbar.ax.tick_params(labelsize=12)
+    ax.set_xlabel("Exit velocity (mph)", fontsize=15)
+    ax.set_ylabel("Launch angle (°)", fontsize=15)
+    ax.set_title(f"Pitcher-year predictive xwOBAcon: {title_model}", fontsize=14)
     ax.set_xlim(0, 120); ax.set_ylim(-90, 90)
-    fig.savefig(out_path, dpi=150)
+    ax.tick_params(labelsize=13)
+    fig.savefig(out_path, dpi=180)
 
 
 # ---------- Main ----------

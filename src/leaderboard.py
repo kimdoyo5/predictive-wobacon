@@ -469,7 +469,7 @@ def render_alpha_plot(bbe: pl.DataFrame, self_keys, s, l, beta_tango,
     else:
         ns = ns_dense
 
-    fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(8, 6.3), constrained_layout=True)
     final_pts: list[tuple[str, float, tuple]] = []
     for name in ordered_names:
         vals_per_group = [np.asarray(v, dtype=np.float64)
@@ -481,24 +481,26 @@ def render_alpha_plot(bbe: pl.DataFrame, self_keys, s, l, beta_tango,
         last = float(alphas[finite][-1])
         line, = ax.plot(ns[finite], alphas[finite],
                         label=f"{name} (α={last:.2f})",
-                        linewidth=1.2, linestyle="-")
+                        linewidth=2.2, linestyle="-")
         final_pts.append((name, last, line.get_color()))
 
     for thr in (0.5, 0.7):
-        ax.axhline(thr, color="gray", linestyle=":", linewidth=0.8)
-    ax.set_xlabel("BIP accumulated chronologically per group (n)")
-    ax.set_ylabel("Cronbach's α (reliability)")
-    ax.set_title(f"{title}\n(cohort: {n_pool} groups with ≥{min_bip_pool} career BIPs, 2016-2025)")
+        ax.axhline(thr, color="gray", linestyle=":", linewidth=1.2)
+    ax.set_xlabel("BIP accumulated chronologically per group (n)", fontsize=15)
+    ax.set_ylabel("Cronbach's α (reliability)", fontsize=15)
+    ax.set_title(f"{title}\n(cohort: {n_pool} groups with ≥{min_bip_pool} career BIPs, 2016-2025)",
+                 fontsize=15)
     ax.set_ylim(-0.02, 1.0)
     ax.set_xlim(1, min_bip_pool * 1.08)
+    ax.tick_params(labelsize=13)
     ax.grid(alpha=0.3, which="both")
-    ax.legend(loc="lower right", fontsize=9, ncol=2)
+    ax.legend(loc="lower right", fontsize=13, ncol=2)
     x_anchor = min_bip_pool
     for name, y, color in final_pts:
         ax.annotate(name, xy=(x_anchor, y), xytext=(4, 0),
-                    textcoords="offset points", fontsize=7, color=color,
+                    textcoords="offset points", fontsize=10, color=color,
                     va="center")
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=180)
     plt.close(fig)
 
 
