@@ -6,7 +6,8 @@ Columns (BIP-weighted on the held-out 2024 → 2025 test set):
                (== r²(self) by construction for univariate predictors equal to the target).
   r² (self)  — corr²(predictor_n, predictor_n+1); year-to-year stability.
 
-Rows: ensemble (50/50 splines + LGBM), gam, lgbm, tango, xwobacon, avg_ev,
+Rows: ensemble (smoothed 50/50 splines + LGBM — the production model
+      defined in src/ensemble.py), gam, lgbm, pwobacon, xwobacon, avg_ev,
       avg_la, hr_rate, naive (constant training-mean target).
 
 Usage:
@@ -26,10 +27,54 @@ sys.path.insert(0, str(ROOT / "src"))
 os.environ.setdefault("MIN_BIP_TRAINVAL", "50")
 import importlib, eval as eval_mod; importlib.reload(eval_mod)
 from eval import load_splits, weighted_rmse, weighted_corr, TEST_N_YEAR
-from ensemble import train_splines, train_lgbm
+from ensemble import (grid_predict_per_bip, grid_predict_per_group,
+                       SMOOTH_SIGMA_EV, SMOOTH_SIGMA_LA)
 from data import load_batted_balls, pitcher_season_ip
 
+ART = ROOT / "artifacts"
 RAW = ROOT / "data" / "raw"
+
+
+def load_cached_grids() -> dict:
+    """Load the (EV, LA) component + smoothed-ensemble grids saved by
+    src/ensemble.py — the production model. All four grain/threshold configs
+    score against these same cached grids, so this is loaded once per run.
+    """
+    cache_path = ART / "ensemble_grid.npz"
+    if not cache_path.exists():
+        raise FileNotFoundError(
+            f"{cache_path} not found — run `uv run python src/ensemble.py` first.")
+    z = np.load(cache_path)
+    required = {"ev_grid", "la_grid", "grid", "spline_grid", "lgbm_grid"}
+    missing = required - set(z.files)
+    if missing:
+        raise RuntimeError(
+            f"{cache_path} is stale (missing {sorted(missing)}). "
+            "Rerun src/ensemble.py to refresh the cache.")
+    return {
+        "ev_grid":       z["ev_grid"],
+        "la_grid":       z["la_grid"],
+        "smoothed_grid": z["grid"],
+        "spline_grid":   z["spline_grid"],
+        "lgbm_grid":     z["lgbm_grid"],
+    }
+
+
+def test_targets(test: pl.DataFrame, group_keys):
+    """Per-group test targets aligned to a group key — replaces what
+    `train_splines`/`train_lgbm` used to compute as a side effect.
+
+    Returns (y_te, w_te, grp_te) where grp_te is keyed by `group_keys` with
+    one row per group, used downstream for joining year-N+1 predictions.
+    """
+    df = test.sort(*group_keys)
+    grp = (df.group_by(list(group_keys), maintain_order=True)
+             .agg(pl.len().alias("n_p"),
+                  pl.col("xwobacon_next").first().alias("y_p"),
+                  pl.col("n_bip_next").first().cast(pl.Float64).alias("w_p")))
+    return (grp["y_p"].to_numpy().astype(np.float64),
+            grp["w_p"].to_numpy().astype(np.float64),
+            grp)
 
 # Pitch-type grain config.
 PT_MIN_BIP = 20
@@ -39,7 +84,7 @@ PT_TEST_YEAR = 2024
 METRICS = ["xwobacon", "avg_ev", "avg_la", "hr_rate"]
 
 
-# --- Tango 12-bucket OLS (3 LA × 4 EV) ---
+# --- pwobacon 12-bucket OLS (3 LA × 4 EV) ---
 
 LA_BREAKS = [8.0, 32.0]
 EV_BREAKS = [95.0, 100.0, 105.0]
@@ -54,7 +99,7 @@ def bucket_id(ev, la):
     return ila * N_EV + iev
 
 
-def tango_design(bbe: pl.DataFrame, group_keys):
+def pwobacon_design(bbe: pl.DataFrame, group_keys):
     """Per group: bucket-frequency vector + key. Targets (y, w) attached if
     `xwobacon_next` and `n_bip_next` columns are present on `bbe`, else NaN.
     """
@@ -87,8 +132,8 @@ def tango_design(bbe: pl.DataFrame, group_keys):
     return X, y, w, key
 
 
-def tango_fit(train_full: pl.DataFrame, group_keys) -> np.ndarray:
-    X_tr, y_tr, w_tr, _ = tango_design(train_full, group_keys)
+def pwobacon_fit(train_full: pl.DataFrame, group_keys) -> np.ndarray:
+    X_tr, y_tr, w_tr, _ = pwobacon_design(train_full, group_keys)
     sw = np.sqrt(w_tr)
     beta, *_ = np.linalg.lstsq(X_tr * sw[:, None], y_tr * sw, rcond=None)
     return beta
@@ -133,9 +178,11 @@ def load_pitcher_grain(min_ip: int = 30):
     alpha_bbe = load_batted_balls()
     group_keys = ("pitcher_id", "year")
     self_keys  = ("pitcher_id",)   # year-N+1 alignment drops the year
-    header_tmpl = ("Pitcher-year test leaderboard "
-                   f"(n={{n}} pitchers, IP≥{min_ip} both yrs, min(IP, IP_next) weighted)")
-    return train_full, test, test_next, group_keys, self_keys, header_tmpl, alpha_bbe
+    png_main = f"{TEST_N_YEAR} Correlation to {TEST_N_YEAR + 1}"
+    png_sub  = (f"Pitcher-year  ·  n={{n}} pitchers, IP ≥ {min_ip} both years  ·  "
+                "min(IP, IP_next)-weighted")
+    return (train_full, test, test_next, group_keys, self_keys,
+            (png_main, png_sub), alpha_bbe)
 
 
 def load_pitch_type_grain(min_bip: int = PT_MIN_BIP):
@@ -189,43 +236,34 @@ def load_pitch_type_grain(min_bip: int = PT_MIN_BIP):
 
     group_keys = ("pitcher_id", "pitch_type", "year")
     self_keys  = ("pitcher_id", "pitch_type")
-    header_tmpl = ("Pitcher × pitch_type × year test leaderboard "
-                   f"(n={{n}} (pitcher, pitch_type) combos, "
-                   f"min(n_bip, n_bip_next)≥{min_bip}, min(n_bip, n_bip_next) weighted)")
-    return train_full, test, test_next, group_keys, self_keys, header_tmpl, alpha_bbe
+    png_main = f"{TEST_N_YEAR} Correlation to {TEST_N_YEAR + 1}"
+    png_sub  = (f"Pitcher × Pitch Type  ·  n={{n}} combos  ·  "
+                f"min(n_bip, n_bip_next) ≥ {min_bip}, weighted")
+    return (train_full, test, test_next, group_keys, self_keys,
+            (png_main, png_sub), alpha_bbe)
 
 
 # --- Cronbach's α curves ---
 
-def per_bip_predictors(test: pl.DataFrame, s, l, beta_tango,
-                       chunk_size: int = 250_000) -> dict[str, np.ndarray]:
-    """For each leaderboard model, predict at the BIP level on `test`.
-
-    Chunked so the spline basis (n × K_ev dense) doesn't allocate gigabytes
-    when called on the full 2016-2025 BBE for the α plot.
+def per_bip_predictors(test: pl.DataFrame, grids: dict,
+                       beta_pwobacon) -> dict[str, np.ndarray]:
+    """For each leaderboard model, predict at the BIP level on `test` by
+    bilinear-interpolating the cached (EV, LA) grids loaded from
+    `ensemble_grid.npz` — no model retraining.
     """
     evs = test["launch_speed"].to_numpy()
     las = test["launch_angle"].to_numpy()
-    n = evs.size
-    beta_mat = s["beta"].reshape(s["K_ev"], s["K_la"])
-
-    p_gam  = np.empty(n, dtype=np.float64)
-    p_lgbm = np.empty(n, dtype=np.float64)
-    for lo in range(0, n, chunk_size):
-        hi = min(lo + chunk_size, n)
-        ev_c = evs[lo:hi]
-        la_c = las[lo:hi]
-        B_ev = s["st_ev"].transform(ev_c.reshape(-1, 1))
-        B_la = s["st_la"].transform(la_c.reshape(-1, 1))
-        p_gam[lo:hi]  = s["intercept"] + (B_ev @ beta_mat * B_la).sum(axis=1)
-        p_lgbm[lo:hi] = (l["booster"].predict(np.column_stack([ev_c, la_c]))
-                         + l["init_score"])
-
     return {
-        "ensemble": 0.5 * p_gam + 0.5 * p_lgbm,
-        "gam":      p_gam,
-        "lgbm":     p_lgbm,
-        "tango":    beta_tango[bucket_id(evs, las)],
+        "ensemble": grid_predict_per_bip(grids["smoothed_grid"],
+                                          grids["ev_grid"], grids["la_grid"],
+                                          evs, las),
+        "gam":      grid_predict_per_bip(grids["spline_grid"],
+                                          grids["ev_grid"], grids["la_grid"],
+                                          evs, las),
+        "lgbm":     grid_predict_per_bip(grids["lgbm_grid"],
+                                          grids["ev_grid"], grids["la_grid"],
+                                          evs, las),
+        "pwobacon": beta_pwobacon[bucket_id(evs, las)],
         "xwobacon": test["xwoba_value"].to_numpy(),
         "avg_ev":   evs,
         "avg_la":   las,
@@ -325,37 +363,40 @@ def load_pitcher_names(needed_ids) -> dict[int, str]:
     return names
 
 
-def _ensemble_per_event(s, l, evs: np.ndarray, las: np.ndarray) -> np.ndarray:
-    B_ev = s["st_ev"].transform(evs.reshape(-1, 1))
-    B_la = s["st_la"].transform(las.reshape(-1, 1))
-    beta_mat = s["beta"].reshape(s["K_ev"], s["K_la"])
-    p_gam = s["intercept"] + (B_ev @ beta_mat * B_la).sum(axis=1)
-    p_lgbm = l["booster"].predict(np.column_stack([evs, las])) + l["init_score"]
-    return 0.5 * p_gam + 0.5 * p_lgbm
+TOP_BOTTOM_YEARS = tuple(range(2016, 2026))
+TOP_BOTTOM_MIN   = 100   # n_bip for pitch_type grain, IP for pitcher_year grain
 
 
-def write_year_top_bottom(s, l, group_keys, year: int, min_threshold: int,
-                          out_path: Path, header: str, n_show: int = 20) -> None:
-    """Rank pitchers (or pitcher × pitch_type) in `year` by ensemble pred xwobacon.
+def render_career_top_bottom_png(grids: dict, group_keys, out_path: Path,
+                                   png_main_title: str, png_subtitle: str,
+                                   n_show: int = 20) -> None:
+    """Rank pitchers (or pitcher × pitch_type) over 2016-2025 by mean
+    ensemble-predicted xwobacon (each BIP weighted equally), and render the
+    top/bottom-N PNG.
 
-    Filter: n_bip ≥ `min_threshold` for pitch_type grain, IP ≥ `min_threshold`
-    for pitcher_year grain. n_bip is the year's own BIP count (no pairing).
+    Filter: total n_bip ≥ TOP_BOTTOM_MIN for pitch_type grain, total IP ≥
+    TOP_BOTTOM_MIN for pitcher_year grain.
     """
     has_pt = "pitch_type" in group_keys
     cols = ["pitcher_id", "year", "launch_speed", "launch_angle",
             "event_type", "xwoba_value"] + (["pitch_type"] if has_pt else [])
-    bb = (pl.scan_parquet(RAW / f"pitches_{year}.parquet")
-            .select(cols)
-            .filter(
-                pl.col("launch_speed").is_not_null()
-                & pl.col("launch_angle").is_not_null()
-                & pl.col("xwoba_value").is_not_null()
-                & (pl.col("pitch_type").is_not_null() if has_pt else pl.lit(True))
-            ).collect())
+    frames = [
+        pl.scan_parquet(RAW / f"pitches_{y}.parquet")
+        .select(cols)
+        .filter(
+            pl.col("launch_speed").is_not_null()
+            & pl.col("launch_angle").is_not_null()
+            & pl.col("xwoba_value").is_not_null()
+            & (pl.col("pitch_type").is_not_null() if has_pt else pl.lit(True))
+        )
+        for y in TOP_BOTTOM_YEARS
+    ]
+    bb = pl.concat(frames, how="vertical").collect()
 
-    p_ens = _ensemble_per_event(s, l,
-                                 bb["launch_speed"].to_numpy(),
-                                 bb["launch_angle"].to_numpy())
+    p_ens = grid_predict_per_bip(
+        grids["smoothed_grid"], grids["ev_grid"], grids["la_grid"],
+        bb["launch_speed"].to_numpy(), bb["launch_angle"].to_numpy(),
+    )
     bb = bb.with_columns(pl.Series("p_ens", p_ens))
 
     agg_keys = ["pitcher_id"] + (["pitch_type"] if has_pt else [])
@@ -366,16 +407,14 @@ def write_year_top_bottom(s, l, group_keys, year: int, min_threshold: int,
     )
 
     if has_pt:
-        agg = agg.filter(pl.col("n_bip") >= min_threshold)
-        show_cols = ["pitcher_name", "pitch_type", "n_bip", "pred_xwobacon", "xwobacon_actual"]
+        agg = agg.filter(pl.col("n_bip") >= TOP_BOTTOM_MIN)
     else:
-        ip = (pitcher_season_ip(years=(year,))
-                .filter(pl.col("year") == year)
-                .select("pitcher_id", "ip"))
+        ip = (pitcher_season_ip(years=TOP_BOTTOM_YEARS)
+                .group_by("pitcher_id")
+                .agg(pl.col("ip").sum().alias("ip")))
         agg = (agg.join(ip, on="pitcher_id", how="left")
                   .with_columns(pl.col("ip").fill_null(0.0))
-                  .filter(pl.col("ip") >= min_threshold))
-        show_cols = ["pitcher_name", "ip", "n_bip", "pred_xwobacon", "xwobacon_actual"]
+                  .filter(pl.col("ip") >= TOP_BOTTOM_MIN))
 
     names = load_pitcher_names(agg["pitcher_id"].to_list())
     agg = agg.with_columns(
@@ -388,49 +427,246 @@ def write_year_top_bottom(s, l, group_keys, year: int, min_threshold: int,
     top = df_sorted.head(n_show)
     bot = df_sorted.tail(n_show).reverse()
 
-    col_labels = {"pitcher_name": "pitcher", "pitch_type": "pitch_type",
-                  "n_bip": "n_bip", "ip": "ip",
-                  "pred_xwobacon": "pred_xwobacon", "xwobacon_actual": "xwobacon"}
-
-    def cell(c, v):
-        if c in ("pred_xwobacon", "xwobacon_actual"):
-            return "—" if v is None or not np.isfinite(v) else f"{v:.5f}"
-        if c == "ip":
-            return f"{v:.1f}"
-        if c == "n_bip":
-            return f"{v:d}"
-        return str(v)
-
-    body_rows = list(df_sorted.iter_rows(named=True))
-    widths = {c: max(len(col_labels[c]),
-                     max((len(cell(c, r[c])) for r in body_rows), default=0))
-              for c in show_cols}
-
-    def fmt_header_row():
-        parts = [f"{'rank':>4}"] + [f"{col_labels[c]:>{widths[c]}s}" for c in show_cols]
-        return "  ".join(parts)
-
-    def fmt_row(rank, row):
-        parts = [f"{rank:>4}"] + [f"{cell(c, row[c]):>{widths[c]}s}" for c in show_cols]
-        return "  ".join(parts)
-
-    sep_len = len(fmt_header_row())
-    lines = [header, ""]
-    for title, sub in (
-        (f"Top {n_show} (lowest predicted xwobacon)", top),
-        (f"Bottom {n_show} (highest predicted xwobacon)", bot),
-    ):
-        lines.append(title)
-        lines.append("-" * sep_len)
-        lines.append(fmt_header_row())
-        for i, row in enumerate(sub.iter_rows(named=True), 1):
-            lines.append(fmt_row(i, row))
-        lines.append("")
-
-    out_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    render_top_bottom_png(
+        main_title=png_main_title, subtitle=png_subtitle,
+        has_pt=has_pt, top=top, bot=bot,
+        out_path=out_path, n_show=n_show,
+    )
 
 
-def render_alpha_plot(bbe: pl.DataFrame, self_keys, s, l, beta_tango,
+# --- Mobile-friendly PNG renderers for the leaderboards ---
+
+def _display_name(name: str) -> str:
+    """Map internal row name (used in data + txt) to the proper display name
+    shown in the PNG output.
+    """
+    mapping = {
+        "ensemble": "Ensemble",
+        "lgbm":     "LightGBM",
+        "gam":      "GAM",
+        "tango":    "pwOBAcon (Tango)",
+        "pwobacon": "pwOBAcon (Tango)",
+        "xwobacon": "xwOBAcon",
+        "avg_ev":   "Avg EV",
+        "avg_la":   "Avg LA",
+        "hr_rate":  "HR rate",
+        "naive":    "Naive",
+    }
+    if name in mapping:
+        return mapping[name]
+    if name.startswith("ensemble (smoothed"):
+        return f"Ensemble (smoothed, σ={SMOOTH_SIGMA_EV:g}/{SMOOTH_SIGMA_LA:g})"
+    if name.startswith("lgbm (smoothed"):
+        return f"LightGBM (smoothed, σ={SMOOTH_SIGMA_EV:g}/{SMOOTH_SIGMA_LA:g})"
+    return name
+
+
+PNG_DPI = 220
+# Editorial palette with maroon highlights.
+HEAD_BG = "#1a1a1a"     # near-black header band
+HEAD_FG = "#ffffff"
+ALT_BG  = "#f5f5f4"     # warm light gray alternating rows
+GRID    = "#ffffff"
+HL_FG   = "#8b2635"     # rich maroon for bolded rows / columns
+TITLE_FG    = "#0c0a09" # near-black main title
+SUBTITLE_FG = "#57534e" # warm gray subtitle
+ACCENT      = "#8b2635" # maroon divider rule
+SECTION_FG  = "#0c0a09" # near-black "Top 20 / Bottom 20" labels
+
+TITLE_BLOCK_IN = 0.85   # vertical inches reserved for main title + subtitle + divider
+
+
+def _draw_title_block(fig, main_title: str, subtitle: str) -> None:
+    """Draw a two-line title block (main + subtitle) and a thin accent divider
+    at the top of `fig`. Caller is responsible for reserving TITLE_BLOCK_IN
+    inches at the top of the figure for this block.
+    """
+    import matplotlib.lines as mlines
+
+    fig_h = fig.get_figheight()
+    y_main = 1 - 0.25 / fig_h
+    y_sub  = 1 - 0.52 / fig_h
+    y_rule = 1 - 0.74 / fig_h
+
+    fig.text(0.5, y_main, main_title, ha="center", va="top",
+             fontsize=14, fontweight="bold", color=TITLE_FG)
+    if subtitle:
+        fig.text(0.5, y_sub, subtitle, ha="center", va="top",
+                 fontsize=8.5, color=SUBTITLE_FG, style="italic")
+    fig.add_artist(mlines.Line2D(
+        [0.08, 0.92], [y_rule, y_rule],
+        transform=fig.transFigure,
+        color=ACCENT, linewidth=1.5, alpha=0.85, solid_capstyle="round",
+    ))
+
+
+def _style_table(table, n_data_rows: int, n_cols: int,
+                 bold_data_rows: set[int] | None = None,
+                 bold_data_cols: set[int] | None = None,
+                 left_align_cols: set[int] | None = None) -> None:
+    bold_data_rows = bold_data_rows or set()
+    bold_data_cols = bold_data_cols or set()
+    left_align_cols = left_align_cols or set()
+
+    for c in range(n_cols):
+        cell = table[(0, c)]
+        cell.set_facecolor(HEAD_BG)
+        cell.set_edgecolor(HEAD_BG)
+        cell.set_text_props(color=HEAD_FG, weight="bold",
+                            ha=("left" if c in left_align_cols else "center"))
+
+    for i in range(n_data_rows):
+        bg = ALT_BG if i % 2 == 0 else "white"
+        row_bold = i in bold_data_rows
+        for c in range(n_cols):
+            cell = table[(i + 1, c)]
+            cell.set_facecolor(bg)
+            cell.set_edgecolor(GRID)
+            col_bold = c in bold_data_cols
+            bold = row_bold or col_bold
+            cell.set_text_props(
+                weight="bold" if bold else "normal",
+                color=HL_FG if bold else "black",
+                ha=("left" if c in left_align_cols else "center"),
+            )
+
+
+def render_main_leaderboard_png(main_title: str, subtitle: str,
+                                 rows: list[dict], out_path: Path) -> None:
+    """Render the per-grain leaderboard table to a mobile-friendly PNG.
+
+    Bolds rows whose `name` is "ensemble" or "xwobacon".
+    """
+    import matplotlib.pyplot as plt
+
+    col_labels = ["#", "Model", "RMSE", "r²(xwOBAcon)", "r² (self)"]
+    col_widths = [0.06, 0.36, 0.14, 0.25, 0.19]
+
+    cell_text: list[list[str]] = []
+    bold_rows: set[int] = set()
+    for i, r in enumerate(rows):
+        cell_text.append([
+            str(i + 1),
+            _display_name(r["name"]),
+            f"{r['rmse']:.4f}",
+            "—" if not np.isfinite(r["r2"])      else f"{r['r2']:.3f}",
+            "—" if not np.isfinite(r["r2_self"]) else f"{r['r2_self']:.3f}",
+        ])
+        if r["name"].startswith("ensemble") or r["name"] == "xwobacon":
+            bold_rows.add(i)
+
+    n = len(rows)
+    row_h = 0.36
+    fig_w = 5.6
+    fig_h = TITLE_BLOCK_IN + row_h * (n + 1) + 0.18
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=PNG_DPI)
+    ax.set_axis_off()
+    ax.set_position([0.03, 0.04, 0.94, 1 - (TITLE_BLOCK_IN / fig_h) - 0.04])
+
+    table = ax.table(
+        cellText=cell_text,
+        colLabels=col_labels,
+        cellLoc="center",
+        colLoc="center",
+        colWidths=col_widths,
+        bbox=[0, 0, 1, 1],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(11)
+
+    _style_table(
+        table, n_data_rows=n, n_cols=len(col_labels),
+        bold_data_rows=bold_rows,
+        left_align_cols={1},
+    )
+
+    _draw_title_block(fig, main_title, subtitle)
+    fig.savefig(out_path, dpi=PNG_DPI, bbox_inches="tight",
+                facecolor="white", pad_inches=0.18)
+    plt.close(fig)
+
+
+def render_top_bottom_png(main_title: str, subtitle: str, has_pt: bool,
+                           top: pl.DataFrame, bot: pl.DataFrame,
+                           out_path: Path, n_show: int = 20) -> None:
+    """Render top/bottom-N ensemble leaderboards as a mobile-friendly PNG.
+
+    Two stacked tables (top, bottom).
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+
+    if has_pt:
+        col_labels = ["#", "pitcher", "Pitch Type", "n_bip", "pred", "actual"]
+        col_widths = [0.07, 0.35, 0.17, 0.11, 0.15, 0.15]
+        meta_col, meta_fmt = "pitch_type", (lambda v: str(v))
+    else:
+        col_labels = ["#", "pitcher", "IP", "n_bip", "pred", "actual"]
+        col_widths = [0.07, 0.40, 0.11, 0.12, 0.15, 0.15]
+        meta_col, meta_fmt = "ip", (lambda v: f"{v:.1f}")
+
+    def to_cells(df: pl.DataFrame) -> list[list[str]]:
+        rows: list[list[str]] = []
+        for i, r in enumerate(df.iter_rows(named=True), 1):
+            pred = r["pred_xwobacon"]
+            act  = r["xwobacon_actual"]
+            rows.append([
+                str(i),
+                r["pitcher_name"],
+                meta_fmt(r[meta_col]),
+                f"{r['n_bip']:d}",
+                "—" if pred is None or not np.isfinite(pred) else f"{pred:.4f}",
+                "—" if act  is None or not np.isfinite(act)  else f"{act:.4f}",
+            ])
+        return rows
+
+    top_rows = to_cells(top)
+    bot_rows = to_cells(bot)
+
+    fig_w = 5.6
+    row_h = 0.32
+    section_title_h = 0.32
+    section_h = section_title_h + row_h * (n_show + 1)
+    fig_h = TITLE_BLOCK_IN + 2 * section_h + 0.4
+
+    fig = plt.figure(figsize=(fig_w, fig_h), dpi=PNG_DPI)
+    gs = GridSpec(2, 1, figure=fig,
+                  top=1 - TITLE_BLOCK_IN / fig_h, bottom=0.03,
+                  left=0.03, right=0.97, hspace=0.20)
+
+    sections = [
+        (gs[0, 0], f"Top {n_show} (lowest predicted xwobacon)", top_rows),
+        (gs[1, 0], f"Bottom {n_show} (highest predicted xwobacon)", bot_rows),
+    ]
+    for slot, sub_title, cells in sections:
+        ax = fig.add_subplot(slot)
+        ax.set_axis_off()
+        ax.text(0.0, 1.0, sub_title, transform=ax.transAxes,
+                ha="left", va="top",
+                fontsize=10.5, fontweight="bold", color=SECTION_FG)
+        table = ax.table(
+            cellText=cells,
+            colLabels=col_labels,
+            cellLoc="center",
+            colLoc="center",
+            colWidths=col_widths,
+            bbox=[0, 0, 1, 0.92],
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(9.5)
+        _style_table(
+            table, n_data_rows=len(cells), n_cols=len(col_labels),
+            bold_data_cols=set(),
+            left_align_cols={1},
+        )
+
+    _draw_title_block(fig, main_title, subtitle)
+    fig.savefig(out_path, dpi=PNG_DPI, bbox_inches="tight",
+                facecolor="white", pad_inches=0.18)
+    plt.close(fig)
+
+
+def render_alpha_plot(bbe: pl.DataFrame, self_keys, grids: dict, beta_pwobacon,
                       ordered_names: list[str], out_path: Path, title: str,
                       min_bip_pool: int) -> None:
     """Chronological-accrual Cronbach's α plot.
@@ -444,7 +680,7 @@ def render_alpha_plot(bbe: pl.DataFrame, self_keys, s, l, beta_tango,
     sort_cols = list(self_keys) + ["game_date", "ab_number", "index_play"]
     bbe = bbe.sort(sort_cols)
 
-    preds = per_bip_predictors(bbe, s, l, beta_tango)
+    preds = per_bip_predictors(bbe, grids, beta_pwobacon)
     bbe = bbe.with_columns([pl.Series(k, v) for k, v in preds.items()])
 
     counts = bbe.group_by(list(self_keys)).agg(pl.len().alias("N"))
@@ -491,7 +727,7 @@ def render_alpha_plot(bbe: pl.DataFrame, self_keys, s, l, beta_tango,
     ax.set_title(f"{title}\n(cohort: {n_pool} groups with ≥{min_bip_pool} career BIPs, 2016-2025)",
                  fontsize=15)
     ax.set_ylim(-0.02, 1.0)
-    ax.set_xlim(1, min_bip_pool * 1.08)
+    ax.set_xlim(1, min_bip_pool * 1.13)
     ax.tick_params(labelsize=13)
     ax.grid(alpha=0.3, which="both")
     ax.legend(loc="lower right", fontsize=13, ncol=2)
@@ -506,48 +742,29 @@ def render_alpha_plot(bbe: pl.DataFrame, self_keys, s, l, beta_tango,
 
 # --- Main ---
 
-def run_grain(loader, out_filename: str, alpha_filename: str | None = None,
+def run_grain(loader, grids: dict, out_filename: str,
+              alpha_filename: str | None = None,
               alpha_min_bip_pool: int = 1000,
-              top_bottom_year: int | None = None,
-              top_bottom_min: int | None = None,
-              top_bottom_filename: str | None = None) -> None:
-    train_full, test, test_next, group_keys, self_keys, header_tmpl, alpha_bbe = loader()
+              top_bottom_png: str | None = None) -> None:
+    train_full, test, test_next, group_keys, self_keys, header_info, alpha_bbe = loader()
+    png_main, png_sub_tmpl = header_info
 
-    # --- Train models ---
-    print("Training splines + LGBM ...", file=sys.stderr, flush=True)
-    s = train_splines(train_full, test, group_keys=group_keys)
-    l = train_lgbm(train_full, test, group_keys=group_keys)
-    assert np.allclose(s["y_te"], l["y_te"])
-    assert np.allclose(s["w_te"], l["w_te"])
+    # All spline/LGBM/ensemble predictions come from the cached (EV, LA)
+    # grids in `grids` (built once by src/ensemble.py), so this script
+    # does no model retraining per grain.
+    y_te, w_te, grp_te = test_targets(test, group_keys)
 
-    y_te   = s["y_te"]
-    w_te   = s["w_te"]
-    grp_te = s["grp_te"]   # has group_keys columns + n_p/y_p/w_p
-    pred_gam  = s["pred_te"]
-    pred_lgbm = l["pred_te"]
-    pred_ens  = 0.5 * pred_gam + 0.5 * pred_lgbm
+    def predict_n(grid):
+        return grid_predict_per_group(test, grid, grids["ev_grid"],
+                                       grids["la_grid"], group_keys, grp_te)
 
-    # Year-N+1 predictions for r²(self): apply f to year-N+1 BBE, mean per
-    # self_keys group, aligned to grp_te.
-    def model_pred_n1(bbe: pl.DataFrame, kind: str) -> np.ndarray:
-        evs = bbe["launch_speed"].to_numpy()
-        las = bbe["launch_angle"].to_numpy()
-        if kind == "splines":
-            B_ev = s["st_ev"].transform(evs.reshape(-1, 1))
-            B_la = s["st_la"].transform(las.reshape(-1, 1))
-            beta_mat = s["beta"].reshape(s["K_ev"], s["K_la"])
-            pred_e = s["intercept"] + (B_ev @ beta_mat * B_la).sum(axis=1)
-        else:
-            X_e = np.column_stack([evs, las])
-            pred_e = l["booster"].predict(X_e) + l["init_score"]
-        df = bbe.with_columns(pl.Series("pred_e", pred_e))
-        agg = df.group_by(list(self_keys)).agg(pl.col("pred_e").mean().alias("p"))
-        keyed = grp_te.select(list(self_keys)).join(agg, on=list(self_keys), how="left")
-        return keyed["p"].to_numpy()
+    def predict_n1(grid):
+        return grid_predict_per_group(test_next, grid, grids["ev_grid"],
+                                       grids["la_grid"], self_keys, grp_te)
 
-    pred_gam_n1  = model_pred_n1(test_next, "splines")
-    pred_lgbm_n1 = model_pred_n1(test_next, "lgbm")
-    pred_ens_n1  = 0.5 * pred_gam_n1 + 0.5 * pred_lgbm_n1
+    pred_gam,  pred_gam_n1  = predict_n(grids["spline_grid"]),  predict_n1(grids["spline_grid"])
+    pred_lgbm, pred_lgbm_n1 = predict_n(grids["lgbm_grid"]),    predict_n1(grids["lgbm_grid"])
+    pred_ens,  pred_ens_n1  = predict_n(grids["smoothed_grid"]), predict_n1(grids["smoothed_grid"])
 
     rows: list[dict] = []
     def add(name, pred_n, pred_n1):
@@ -572,21 +789,21 @@ def run_grain(loader, out_filename: str, alpha_filename: str | None = None,
     pred_naive = np.full_like(y_te, naive_mean, dtype=np.float64)
     add("naive", pred_naive, pred_naive)
 
-    # --- Tango ---
-    beta_tango = tango_fit(train_full, group_keys)
-    X_n,  _, _, key_n  = tango_design(test,      group_keys)
-    X_n1, _, _, key_n1 = tango_design(test_next, group_keys)
+    # --- pwobacon ---
+    beta_pwobacon = pwobacon_fit(train_full, group_keys)
+    X_n,  _, _, key_n  = pwobacon_design(test,      group_keys)
+    X_n1, _, _, key_n1 = pwobacon_design(test_next, group_keys)
 
     def to_key_tuples(df: pl.DataFrame, cols) -> list[tuple]:
         return list(zip(*[df[c].to_list() for c in cols]))
 
-    pred_n_map  = dict(zip(to_key_tuples(key_n,  group_keys), (X_n  @ beta_tango).tolist()))
-    pred_n1_map = dict(zip(to_key_tuples(key_n1, self_keys),  (X_n1 @ beta_tango).tolist()))
+    pred_n_map  = dict(zip(to_key_tuples(key_n,  group_keys), (X_n  @ beta_pwobacon).tolist()))
+    pred_n1_map = dict(zip(to_key_tuples(key_n1, self_keys),  (X_n1 @ beta_pwobacon).tolist()))
     keys_te_n   = to_key_tuples(grp_te, group_keys)
     keys_te_n1  = to_key_tuples(grp_te, self_keys)
     p_n  = np.array([pred_n_map.get(k,  np.nan) for k in keys_te_n])
     p_n1 = np.array([pred_n1_map.get(k, np.nan) for k in keys_te_n1])
-    add("tango", p_n, p_n1)
+    add("pwobacon", p_n, p_n1)
 
     # --- Univariate linregs on per-season metrics ---
     pst_trv = season_metrics(train_full, group_keys)
@@ -619,48 +836,44 @@ def run_grain(loader, out_filename: str, alpha_filename: str | None = None,
         rself = weighted_corr(x_n[ok], x_n1[ok], w_te[ok]) ** 2
         rows.append({"name": metric, "rmse": rmse, "r2": r2, "r2_self": rself})
 
-    # --- Print + write artifact ---
     rows.sort(key=lambda r: r["rmse"])
-    lines = [
-        "",
-        header_tmpl.format(n=len(y_te)),
-        f"{'rank':>4}  {'name':<12s}  {'rmse':>8s}  {'r²':>8s}  {'r² (self)':>10s}",
-        "-" * 50,
-    ]
-    def fmt(v: float, spec: str) -> str:
-        width = int(spec.split(".")[0].lstrip("+")) if "." in spec else len(f"{0:{spec}}")
-        return f"{'—':>{width}}" if not np.isfinite(v) else f"{v:{spec}}"
-    for i, r in enumerate(rows, 1):
-        lines.append(f"{i:>4}  {r['name']:<12s}  {r['rmse']:.5f}  "
-                     f"{fmt(r['r2'], '+8.4f')}  {fmt(r['r2_self'], '+10.6f')}")
-    out = "\n".join(lines) + "\n"
-    print(out, end="")
-
     art = ROOT / "artifacts"
     art.mkdir(exist_ok=True)
-    (art / out_filename).write_text(out, encoding="utf-8")
+    png_path = art / (Path(out_filename).stem + ".png")
+    render_main_leaderboard_png(
+        main_title=png_main,
+        subtitle=png_sub_tmpl.format(n=len(y_te)),
+        rows=rows,
+        out_path=png_path,
+    )
+    print(f"saved {png_path.name}", file=sys.stderr)
 
-    if top_bottom_year is not None:
+    if top_bottom_png is not None:
         has_pt = "pitch_type" in group_keys
-        thresh_label = (f"n_bip ≥ {top_bottom_min}" if has_pt
-                        else f"IP ≥ {top_bottom_min}")
-        grain_label = ("Pitcher × pitch_type" if has_pt else "Pitcher")
-        header = (f"{grain_label} top/bottom 20 in {top_bottom_year} "
-                  f"by ensemble (50/50 splines + LGBM) predicted xwobacon "
-                  f"({thresh_label}, {top_bottom_year} stats only).")
-        write_year_top_bottom(
-            s, l, group_keys,
-            year=top_bottom_year,
-            min_threshold=top_bottom_min,
-            out_path=art / top_bottom_filename,
-            header=header,
+        thresh_label = (f"n_bip ≥ {TOP_BOTTOM_MIN}" if has_pt
+                        else f"IP ≥ {TOP_BOTTOM_MIN}")
+        png_grain_label = ("Pitcher × Pitch Type" if has_pt else "Pitcher")
+        yr_label = f"{TOP_BOTTOM_YEARS[0]}-{TOP_BOTTOM_YEARS[-1]}"
+        png_main_tb = f"Top / Bottom 20 — {png_grain_label}, {yr_label}"
+        png_sub_tb  = ("Ranked by ensemble (smoothed splines + LGBM) "
+                       f"predicted xwobacon  ·  {thresh_label}")
+        tb_png_path = art / top_bottom_png
+        render_career_top_bottom_png(
+            grids, group_keys,
+            out_path=tb_png_path,
+            png_main_title=png_main_tb,
+            png_subtitle=png_sub_tb,
         )
-        print(f"saved {top_bottom_filename}")
+        print(f"saved {tb_png_path.name}", file=sys.stderr)
 
     if alpha_filename is not None:
+        # α plot has always omitted gam/lgbm/naive — show ensemble + the
+        # univariate baselines + pwobacon.
+        alpha_skip = {"gam", "lgbm", "naive"}
         render_alpha_plot(
-            alpha_bbe, self_keys, s, l, beta_tango,
-            ordered_names=[r["name"] for r in rows if r["name"] not in ("gam", "lgbm", "naive")],
+            alpha_bbe, self_keys, grids, beta_pwobacon,
+            ordered_names=[r["name"] for r in rows
+                            if r["name"] not in alpha_skip],
             out_path=art / alpha_filename,
             title=("Chronological Cronbach's α accrual"),
             min_bip_pool=alpha_min_bip_pool,
@@ -670,24 +883,24 @@ def run_grain(loader, out_filename: str, alpha_filename: str | None = None,
 
 def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8")
+    grids = load_cached_grids()
+    yr_tag = f"{TOP_BOTTOM_YEARS[0]}_{TOP_BOTTOM_YEARS[-1]}"
     for i, min_bip in enumerate((20, 100)):
         run_grain(lambda mb=min_bip: load_pitch_type_grain(min_bip=mb),
+                  grids,
                   f"leaderboard_pitch_type_bip{min_bip}.txt",
                   alpha_filename="cronbach_alpha_pitch_type.png" if i == 0 else None,
                   alpha_min_bip_pool=500,
-                  top_bottom_year=2025 if min_bip == 20 else None,
-                  top_bottom_min=20 if min_bip == 20 else None,
-                  top_bottom_filename=("top_bottom_ensemble_pitch_type_2025_bip20.txt"
-                                       if min_bip == 20 else None))
+                  top_bottom_png=(f"top_bottom_ensemble_pitch_type_{yr_tag}_bip{TOP_BOTTOM_MIN}.png"
+                                   if min_bip == 20 else None))
     for i, min_ip in enumerate((20, 100)):
         run_grain(lambda mi=min_ip: load_pitcher_grain(min_ip=mi),
+                  grids,
                   f"leaderboard_pitcher_year_ip{min_ip}.txt",
                   alpha_filename="cronbach_alpha_pitcher_year.png" if i == 0 else None,
                   alpha_min_bip_pool=1500,
-                  top_bottom_year=2025 if min_ip == 20 else None,
-                  top_bottom_min=20 if min_ip == 20 else None,
-                  top_bottom_filename=("top_bottom_ensemble_pitcher_year_2025_ip20.txt"
-                                       if min_ip == 20 else None))
+                  top_bottom_png=(f"top_bottom_ensemble_pitcher_year_{yr_tag}_ip{TOP_BOTTOM_MIN}.png"
+                                   if min_ip == 20 else None))
     return 0
 
 

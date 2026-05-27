@@ -1,4 +1,4 @@
-"""Final pitcher-year predictive-xwOBAcon ensemble.
+"""Final pitcher-year predictive-xwOBAcon ensemble (Gaussian-smoothed).
 
 Two component models trained on per-event (EV, LA) with a custom group-
 aggregated MSE loss, grouped by (pitcher_id, year):
@@ -6,14 +6,17 @@ aggregated MSE loss, grouped by (pitcher_id, year):
   1. GAM splines: 50×50 degree-1 B-splines, P-spline penalty α=1000.
   2. LGBM: 3000 rounds, num_leaves=5, min_data_in_leaf=1000.
 
-Output: equal-weight 50/50 average of the two predictions.
+Their 50/50 average is evaluated on a dense 481×721 (EV, LA) grid (0.25
+mph × 0.25°), then Gaussian-smoothed at σ=(5 mph, 5°) to regularize
+LGBM's step-function edges. The smoothed grid is THE production ensemble:
+per-group predictions = bilinear interpolation per BIP, averaged per group.
 
 Filters and weights: see eval.load_splits (this module overrides
 MIN_BIP_TRAINVAL=50 for training; trainval = train ∪ val with no val
 held out).
 
 Usage:
-  uv run python src/ensemble.py   # train + evaluate + render heatmaps
+  uv run python src/ensemble.py
 """
 from __future__ import annotations
 
@@ -25,6 +28,8 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import lightgbm as lgb
+from scipy.ndimage import gaussian_filter
+from scipy.interpolate import RegularGridInterpolator
 from sklearn.preprocessing import SplineTransformer
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -34,11 +39,17 @@ from eval import load_splits, weighted_rmse, weighted_r2
 
 ART = ROOT / "artifacts"
 
-# Hyperparams (final).
+# Component hyperparams (final).
 SPLINE_KNOTS  = 50
 SPLINE_DEGREE = 1
 SPLINE_ALPHA  = 1000.0
 LGBM_NUM_BOOST_ROUND = 3000
+
+# Cached (EV, LA) ensemble grid + Gaussian smoothing.
+GRID_N_EV = 481         # 0..120 mph at 0.25 mph
+GRID_N_LA = 721         # -90..90 deg at 0.25°
+SMOOTH_SIGMA_EV = 5.0   # mph
+SMOOTH_SIGMA_LA = 5.0   # degrees
 
 # Default group key used by all model-training functions. Override via
 # `group_keys=("pitcher_id", "pitch_type", "year")` for the pitch-type grain.
@@ -151,7 +162,7 @@ def lgbm_aggregated_objective(group_starts, n_p, y_p, w_p):
     return obj
 
 
-# ---------- Train + predict ----------
+# ---------- Train + predict (per-group, closed-form) ----------
 
 def train_splines(train: pl.DataFrame, test: pl.DataFrame,
                    group_keys=PITCHER_YEAR_KEYS):
@@ -193,67 +204,107 @@ def train_lgbm(train: pl.DataFrame, test: pl.DataFrame,
     }
 
 
+# ---------- Cached + smoothed ensemble grid (the production model) ----------
+
+def _component_grids(s, l):
+    """Evaluate spline and LGBM surfaces on the shared (EV, LA) grid."""
+    ev_grid = np.linspace(0.0, 120.0, GRID_N_EV)
+    la_grid = np.linspace(-90.0, 90.0, GRID_N_LA)
+    B_ev = s["st_ev"].transform(ev_grid.reshape(-1, 1))
+    B_la = s["st_la"].transform(la_grid.reshape(-1, 1))
+    beta_mat = s["beta"].reshape(s["K_ev"], s["K_la"])
+    spline_grid = s["intercept"] + B_ev @ beta_mat @ B_la.T
+    EV, LA = np.meshgrid(ev_grid, la_grid, indexing="ij")
+    lgbm_grid = (l["booster"].predict(np.column_stack([EV.ravel(), LA.ravel()]))
+                  + l["init_score"]).reshape(EV.shape)
+    return ev_grid, la_grid, spline_grid, lgbm_grid
+
+
+def build_smoothed_ensemble_grid(s, l,
+                                   sigma_ev: float = SMOOTH_SIGMA_EV,
+                                   sigma_la: float = SMOOTH_SIGMA_LA):
+    """0.5*spline + 0.5*LGBM on (EV, LA), then Gauss-smoothed.
+
+    Returns (ev_grid, la_grid, smoothed_grid).
+    """
+    ev_grid, la_grid, spline_grid, lgbm_grid = _component_grids(s, l)
+    ens_grid = 0.5 * spline_grid + 0.5 * lgbm_grid
+    dev = ev_grid[1] - ev_grid[0]
+    dla = la_grid[1] - la_grid[0]
+    smoothed = gaussian_filter(ens_grid,
+                                sigma=(sigma_ev / dev, sigma_la / dla),
+                                mode="nearest")
+    return ev_grid, la_grid, smoothed
+
+
+def grid_predict_per_bip(grid: np.ndarray, ev_grid: np.ndarray,
+                          la_grid: np.ndarray,
+                          evs: np.ndarray, las: np.ndarray) -> np.ndarray:
+    """Bilinear-interpolate `grid` at per-BIP (EV, LA) coordinates."""
+    interp = RegularGridInterpolator((ev_grid, la_grid), grid,
+                                       bounds_error=False, fill_value=None)
+    evs_c = np.clip(evs, ev_grid[0], ev_grid[-1])
+    las_c = np.clip(las, la_grid[0], la_grid[-1])
+    return interp(np.column_stack([evs_c, las_c]))
+
+
+def grid_predict_per_group(bbe: pl.DataFrame, grid: np.ndarray,
+                            ev_grid: np.ndarray, la_grid: np.ndarray,
+                            group_keys, grp_te: pl.DataFrame) -> np.ndarray:
+    """Per-BIP `grid` lookup, mean per `group_keys`, aligned to `grp_te`."""
+    p_e = grid_predict_per_bip(grid, ev_grid, la_grid,
+                                bbe["launch_speed"].to_numpy(),
+                                bbe["launch_angle"].to_numpy())
+    df = bbe.with_columns(pl.Series("p_e", p_e))
+    agg = df.group_by(list(group_keys)).agg(pl.col("p_e").mean().alias("p"))
+    return (grp_te.select(list(group_keys))
+                   .join(agg, on=list(group_keys), how="left")["p"].to_numpy())
+
+
 # ---------- Heatmap ----------
 
-def render_heatmap(spline_res, lgbm_res, out_path: Path, which: str = "ensemble"):
+def render_heatmap(out_path: Path, ev_grid: np.ndarray, la_grid: np.ndarray,
+                    grid: np.ndarray, title: str,
+                    density_bbe: pl.DataFrame | None = None) -> None:
+    """Heatmap of `grid` on (EV, LA), masked by BBE density when provided."""
     import matplotlib.pyplot as plt
     from matplotlib import colors as mcolors
     from matplotlib.ticker import MultipleLocator
 
-    ev_grid = np.linspace(0, 120, 240)
-    la_grid = np.linspace(-90, 90, 240)
-    # Spline predictions on grid
-    B_ev = spline_res["st_ev"].transform(ev_grid.reshape(-1, 1))
-    B_la = spline_res["st_la"].transform(la_grid.reshape(-1, 1))
-    beta_mat = spline_res["beta"].reshape(spline_res["K_ev"], spline_res["K_la"])
-    pred_s = spline_res["intercept"] + B_ev @ beta_mat @ B_la.T
-    # LGBM predictions on grid
     EV, LA = np.meshgrid(ev_grid, la_grid, indexing="ij")
-    Xg = np.column_stack([EV.ravel(), LA.ravel()])
-    pred_l = (lgbm_res["booster"].predict(Xg) + lgbm_res["init_score"]).reshape(EV.shape)
-
-    if which == "splines":
-        pred = pred_s
-        title_model = f"GAM splines (K=50, deg=1, P-spline α={SPLINE_ALPHA:g})"
-    elif which == "lgbm":
-        pred = pred_l
-        title_model = f"LightGBM (defaults, {LGBM_NUM_BOOST_ROUND} rounds)"
+    if density_bbe is not None:
+        H, xe, ye = np.histogram2d(
+            density_bbe["launch_speed"].to_numpy(),
+            density_bbe["launch_angle"].to_numpy(),
+            bins=[120, 120], range=[[0, 120], [-90, 90]],
+        )
+        ix = np.clip(np.searchsorted(xe, ev_grid, side="right") - 1, 0, H.shape[0] - 1)
+        iy = np.clip(np.searchsorted(ye, la_grid, side="right") - 1, 0, H.shape[1] - 1)
+        Hgrid = H[np.ix_(ix, iy)]
+        mask = Hgrid < max(1, H.sum() * 1e-6)
+        grid_m = np.ma.array(grid, mask=mask)
     else:
-        pred = 0.5 * pred_s + 0.5 * pred_l
-        title_model = (f"50/50 ensemble (Splines + LGBM)\n"
-                       f"Splines: K=50, deg=1, P-spline α={SPLINE_ALPHA:g}    "
-                       f"LGBM: defaults, {LGBM_NUM_BOOST_ROUND} rounds")
-
-    # Density mask
-    bb = load_batted_balls()
-    H, xe, ye = np.histogram2d(
-        bb["launch_speed"].to_numpy(), bb["launch_angle"].to_numpy(),
-        bins=[120, 120], range=[[0, 120], [-90, 90]],
-    )
-    ix = np.clip(np.searchsorted(xe, ev_grid, side="right") - 1, 0, H.shape[0] - 1)
-    iy = np.clip(np.searchsorted(ye, la_grid, side="right") - 1, 0, H.shape[1] - 1)
-    Hgrid = H[np.ix_(ix, iy)]
-    mask = Hgrid < max(1, H.sum() * 1e-6)
-    pred_m = np.ma.array(pred, mask=mask)
+        grid_m = grid
 
     fig, ax = plt.subplots(figsize=(8, 6.3), constrained_layout=True)
     league_xwobacon = 0.371
-    half_range = 0.2
-    vmin = league_xwobacon - half_range
-    vmax = league_xwobacon + half_range
-    norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=league_xwobacon, vmax=vmax)
+    half = 0.18
+    norm = mcolors.TwoSlopeNorm(vmin=league_xwobacon - half,
+                                 vcenter=league_xwobacon,
+                                 vmax=league_xwobacon + half)
     cmap = plt.get_cmap("RdBu_r").copy(); cmap.set_bad("#dddddd")
-    im = ax.pcolormesh(EV, LA, pred_m, shading="auto", cmap=cmap, norm=norm)
+    im = ax.pcolormesh(EV, LA, grid_m, shading="auto", cmap=cmap, norm=norm)
     cbar = fig.colorbar(im, ax=ax)
     cbar.set_label("predicted next-year pitcher xwOBAcon", fontsize=14)
     cbar.ax.yaxis.set_major_locator(MultipleLocator(0.05))
     cbar.ax.tick_params(labelsize=12)
     ax.set_xlabel("Exit velocity (mph)", fontsize=15)
     ax.set_ylabel("Launch angle (°)", fontsize=15)
-    ax.set_title(f"Pitcher-year predictive xwOBAcon: {title_model}", fontsize=14)
+    ax.set_title(title, fontsize=16, pad=10)
     ax.set_xlim(0, 120); ax.set_ylim(-90, 90)
     ax.tick_params(labelsize=13)
     fig.savefig(out_path, dpi=180)
+    plt.close(fig)
 
 
 # ---------- Main ----------
@@ -262,7 +313,6 @@ def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8")
     ART.mkdir(parents=True, exist_ok=True)
 
-    # Default to BIP=50 if not set.
     os.environ.setdefault("MIN_BIP_TRAINVAL", "50")
     # Reimport eval after env-var seed.
     import importlib, eval as eval_mod
@@ -297,34 +347,61 @@ def main() -> int:
     print(f"  METRIC lgbm_test_r2={r2_l:.5f}")
     print(f"  ({time.time()-t:.0f}s)")
 
-    # Sanity: same target alignment.
     assert np.allclose(s["y_te"], l["y_te"])
     assert np.allclose(s["w_te"], l["w_te"])
 
-    pred_ens = 0.5 * s["pred_te"] + 0.5 * l["pred_te"]
+    print(f"\n=== Ensemble = Gauss(0.5*spline + 0.5*LGBM), "
+          f"σ=({SMOOTH_SIGMA_EV:g} mph, {SMOOTH_SIGMA_LA:g}°) on "
+          f"{GRID_N_EV}×{GRID_N_LA} grid ===")
+    t = time.time()
+    ev_grid, la_grid, smoothed_grid = build_smoothed_ensemble_grid(s, l)
+    pred_ens = grid_predict_per_group(test, smoothed_grid, ev_grid, la_grid,
+                                        PITCHER_YEAR_KEYS, s["grp_te"])
     rmse_e = weighted_rmse(s["y_te"], pred_ens, s["w_te"])
     r2_e = weighted_r2(s["y_te"], pred_ens, s["w_te"])
-    print(f"\n=== 50/50 Ensemble ===")
     print(f"  METRIC ensemble_test_rmse={rmse_e:.5f}")
     print(f"  METRIC ensemble_test_r2={r2_e:.5f}")
+    print(f"  ({time.time()-t:.0f}s)")
+
     print(f"\n  Splines:  {rmse_s:.5f}, r²={r2_s:+.4f}")
     print(f"  LGBM:     {rmse_l:.5f}, r²={r2_l:+.4f}")
     print(f"  Ensemble: {rmse_e:.5f}, r²={r2_e:+.4f}")
 
-    # Save model artifacts.
-    np.savez(ART / "ensemble_splines.npz",
-             beta=s["beta"].reshape(s["K_ev"], s["K_la"]),
-             intercept=s["intercept"])
-    l["booster"].save_model(str(ART / "ensemble_lgbm.txt"))
-    np.savez(ART / "ensemble_lgbm_meta.npz", init_score=l["init_score"])
-    print(f"\nsaved ensemble_splines.npz, ensemble_lgbm.txt, ensemble_lgbm_meta.npz")
+    # Compute the un-smoothed component grids — needed both for heatmaps and
+    # for downstream consumers (src/leaderboard.py) that score GAM and LGBM
+    # rows from cached grids instead of retraining.
+    _, _, spline_grid, lgbm_grid = _component_grids(s, l)
 
-    for which, fname in [("ensemble", "heatmap_ensemble.png"),
-                          ("splines",  "heatmap_gam.png"),
-                          ("lgbm",     "heatmap_lgbm.png")]:
-        out = ART / fname
-        render_heatmap(s, l, out, which=which)
-        print(f"saved {out.name}")
+    # Save the production model: smoothed ensemble + un-smoothed component
+    # grids on the shared (EV, LA) axes.
+    np.savez(ART / "ensemble_grid.npz",
+             ev_grid=ev_grid, la_grid=la_grid,
+             grid=smoothed_grid,
+             spline_grid=spline_grid, lgbm_grid=lgbm_grid,
+             sigma_ev=SMOOTH_SIGMA_EV, sigma_la=SMOOTH_SIGMA_LA)
+    print(f"\nsaved ensemble_grid.npz")
+
+    # Heatmaps: ensemble (= the smoothed model) + raw components.
+    density_bbe = load_batted_balls()
+
+    render_heatmap(
+        ART / "heatmap_ensemble.png", ev_grid, la_grid, smoothed_grid,
+        "Pitcher Predictive xwOBAcon (Ensemble)",
+        density_bbe=density_bbe,
+    )
+    print("saved heatmap_ensemble.png")
+    render_heatmap(
+        ART / "heatmap_gam.png", ev_grid, la_grid, spline_grid,
+        "Pitcher Predictive xwOBAcon (GAM)",
+        density_bbe=density_bbe,
+    )
+    print("saved heatmap_gam.png")
+    render_heatmap(
+        ART / "heatmap_lgbm.png", ev_grid, la_grid, lgbm_grid,
+        "Pitcher Predictive xwOBAcon (LGBM)",
+        density_bbe=density_bbe,
+    )
+    print("saved heatmap_lgbm.png")
 
     print(f"\ntotal: {time.time()-t0:.0f}s")
     return 0
