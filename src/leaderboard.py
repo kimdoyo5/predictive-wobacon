@@ -124,17 +124,18 @@ def fit_univariate(x_tr, y_tr, w_tr) -> tuple[float, float]:
 def load_pitcher_grain(min_ip: int = 30):
     """Pitcher-year grain: defers to eval.load_splits().
 
-    `test_alpha` is the unfiltered test-year BBE slice — all pitchers, no IP
-    threshold, no pair requirement — used for the Cronbach's α plot.
+    `alpha_bbe` is the full 2016-2025 BBE — every pitcher, every year, no IP
+    threshold or pair requirement — used for the chronological Cronbach's α
+    accrual plot.
     """
     train, val, test, test_next = load_splits(min_ip=min_ip)
     train_full = pl.concat([train, val])
-    test_alpha = load_batted_balls().filter(pl.col("year") == TEST_N_YEAR)
+    alpha_bbe = load_batted_balls()
     group_keys = ("pitcher_id", "year")
     self_keys  = ("pitcher_id",)   # year-N+1 alignment drops the year
     header_tmpl = ("Pitcher-year test leaderboard "
                    f"(n={{n}} pitchers, IP≥{min_ip} both yrs, min(IP, IP_next) weighted)")
-    return train_full, test, test_next, group_keys, self_keys, header_tmpl, test_alpha
+    return train_full, test, test_next, group_keys, self_keys, header_tmpl, alpha_bbe
 
 
 def load_pitch_type_grain(min_bip: int = PT_MIN_BIP):
@@ -148,8 +149,9 @@ def load_pitch_type_grain(min_bip: int = PT_MIN_BIP):
     for y in range(2016, 2026):
         frames.append(
             pl.scan_parquet(RAW / f"pitches_{y}.parquet")
-            .select("pitcher_id", "year", "pitch_type",
-                    "launch_speed", "launch_angle", "event_type", "xwoba_value")
+            .select("pitcher_id", "year", "game_date", "ab_number", "index_play",
+                    "pitch_type", "launch_speed", "launch_angle",
+                    "event_type", "xwoba_value")
             .filter(
                 pl.col("launch_speed").is_not_null()
                 & pl.col("launch_angle").is_not_null()
@@ -182,28 +184,42 @@ def load_pitch_type_grain(min_bip: int = PT_MIN_BIP):
     test_next = (bb.filter(pl.col("year") == PT_TEST_YEAR + 1)
                    .join(test_keys.select("pitcher_id", "pitch_type"),
                          on=["pitcher_id", "pitch_type"], how="inner"))
-    test_alpha = bb.filter(pl.col("year") == PT_TEST_YEAR)
+    # Full 2016-2025 BBE with non-null pitch_type, for the chronological α plot.
+    alpha_bbe = bb
 
     group_keys = ("pitcher_id", "pitch_type", "year")
     self_keys  = ("pitcher_id", "pitch_type")
     header_tmpl = ("Pitcher × pitch_type × year test leaderboard "
                    f"(n={{n}} (pitcher, pitch_type) combos, "
                    f"min(n_bip, n_bip_next)≥{min_bip}, min(n_bip, n_bip_next) weighted)")
-    return train_full, test, test_next, group_keys, self_keys, header_tmpl, test_alpha
+    return train_full, test, test_next, group_keys, self_keys, header_tmpl, alpha_bbe
 
 
 # --- Cronbach's α curves ---
 
-def per_bip_predictors(test: pl.DataFrame, s, l, beta_tango) -> dict[str, np.ndarray]:
-    """For each leaderboard model, predict at the BIP level on `test`."""
+def per_bip_predictors(test: pl.DataFrame, s, l, beta_tango,
+                       chunk_size: int = 250_000) -> dict[str, np.ndarray]:
+    """For each leaderboard model, predict at the BIP level on `test`.
+
+    Chunked so the spline basis (n × K_ev dense) doesn't allocate gigabytes
+    when called on the full 2016-2025 BBE for the α plot.
+    """
     evs = test["launch_speed"].to_numpy()
     las = test["launch_angle"].to_numpy()
-
-    B_ev = s["st_ev"].transform(evs.reshape(-1, 1))
-    B_la = s["st_la"].transform(las.reshape(-1, 1))
+    n = evs.size
     beta_mat = s["beta"].reshape(s["K_ev"], s["K_la"])
-    p_gam = s["intercept"] + (B_ev @ beta_mat * B_la).sum(axis=1)
-    p_lgbm = l["booster"].predict(np.column_stack([evs, las])) + l["init_score"]
+
+    p_gam  = np.empty(n, dtype=np.float64)
+    p_lgbm = np.empty(n, dtype=np.float64)
+    for lo in range(0, n, chunk_size):
+        hi = min(lo + chunk_size, n)
+        ev_c = evs[lo:hi]
+        la_c = las[lo:hi]
+        B_ev = s["st_ev"].transform(ev_c.reshape(-1, 1))
+        B_la = s["st_la"].transform(la_c.reshape(-1, 1))
+        p_gam[lo:hi]  = s["intercept"] + (B_ev @ beta_mat * B_la).sum(axis=1)
+        p_lgbm[lo:hi] = (l["booster"].predict(np.column_stack([ev_c, la_c]))
+                         + l["init_score"])
 
     return {
         "ensemble": 0.5 * p_gam + 0.5 * p_lgbm,
@@ -217,26 +233,58 @@ def per_bip_predictors(test: pl.DataFrame, s, l, beta_tango) -> dict[str, np.nda
     }
 
 
-def alpha_curve(per: pl.DataFrame, n_max: int) -> tuple[np.ndarray, np.ndarray]:
-    """Spearman-Brown reliability α(n) from per-group (n, mean, var).
+def chronological_alpha_curve(values_per_group: list[np.ndarray],
+                              ns: np.ndarray) -> np.ndarray:
+    """Empirical one-way-ANOVA reliability evaluated at accumulating BIPs.
 
-    σ²_e: mean of per-group within-variances (each group weighted equally).
-    σ²_t: max(Var(group_means) − mean(σ²_e / n_p), 0).
-    α(n) = n σ²_t / (n σ²_t + σ²_e).
+    Each element of `values_per_group` is the metric series for one group
+    (pitcher or pitcher × pitch_type), ordered chronologically. For each
+    n in `ns`, restrict to groups with ≥n BIPs, take their first n values,
+    and compute:
+
+        σ²_e(n)       = mean within-group sample variance of those n values
+        σ²_between(n) = Var across groups of [mean of those n values]
+        σ²_t(n)       = max(σ²_between(n) − σ²_e(n)/n, 0)
+        α(n)          = σ²_t(n) / σ²_between(n)
+
+    α(n) is NaN where n<2 or fewer than 5 groups qualify.
     """
-    n   = per["n"].to_numpy()
-    mu  = per["mean"].to_numpy()
-    var = per["var"].to_numpy()  # null where n=1
+    if not values_per_group:
+        return np.full(len(ns), np.nan)
 
-    mask = (n >= 2) & np.isfinite(var)
-    sigma2_e = float(var[mask].mean()) if mask.any() else 0.0
+    lens = np.array([len(v) for v in values_per_group], dtype=np.int64)
+    max_len = int(lens.max()) if lens.size else 0
+    n_groups = len(values_per_group)
 
-    var_means = float(np.var(mu, ddof=1)) if len(mu) >= 2 else 0.0
-    sigma2_t  = max(var_means - float((sigma2_e / n).mean()), 0.0)
+    cs  = np.full((n_groups, max_len), np.nan)
+    cs2 = np.full((n_groups, max_len), np.nan)
+    for i, vals in enumerate(values_per_group):
+        L = lens[i]
+        if L == 0:
+            continue
+        arr = np.asarray(vals, dtype=np.float64)
+        cs[i,  :L] = arr.cumsum()
+        cs2[i, :L] = (arr * arr).cumsum()
 
-    ns = np.arange(1, n_max + 1)
-    alphas = ns * sigma2_t / (ns * sigma2_t + sigma2_e) if sigma2_e > 0 else np.ones_like(ns, dtype=float)
-    return ns, alphas
+    alphas = np.full(len(ns), np.nan)
+    for j, n in enumerate(ns):
+        if n < 2 or n > max_len:
+            continue
+        col = n - 1
+        mask = lens >= n
+        if int(mask.sum()) < 5:
+            continue
+        s  = cs[mask,  col]
+        ss = cs2[mask, col]
+        m  = s / n
+        v  = (ss - s * s / n) / (n - 1)
+        sigma2_e       = float(np.nanmean(v))
+        sigma2_between = float(np.var(m, ddof=1))
+        if sigma2_between <= 0:
+            continue
+        sigma2_t = max(sigma2_between - sigma2_e / n, 0.0)
+        alphas[j] = sigma2_t / sigma2_between
+    return alphas
 
 
 PITCHER_NAME_CACHE = ROOT / "data" / "raw" / "pitcher_names.parquet"
@@ -382,35 +430,76 @@ def write_year_top_bottom(s, l, group_keys, year: int, min_threshold: int,
     out_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
-def render_alpha_plot(test: pl.DataFrame, self_keys, s, l, beta_tango,
-                      ordered_names: list[str], out_path: Path, title: str) -> None:
+def render_alpha_plot(bbe: pl.DataFrame, self_keys, s, l, beta_tango,
+                      ordered_names: list[str], out_path: Path, title: str,
+                      min_bip_pool: int) -> None:
+    """Chronological-accrual Cronbach's α plot.
+
+    Sort BBE chronologically within each group (pitcher or pitcher × pitch_type),
+    fix a cohort of groups with ≥`min_bip_pool` BIPs over 2016-2025, and plot
+    α(n) for n=2..min_bip_pool using `chronological_alpha_curve`.
+    """
     import matplotlib.pyplot as plt
 
-    preds = per_bip_predictors(test, s, l, beta_tango)
-    test_p = test.with_columns([pl.Series(k, v) for k, v in preds.items()])
+    sort_cols = list(self_keys) + ["game_date", "ab_number", "index_play"]
+    bbe = bbe.sort(sort_cols)
 
-    sizes = test_p.group_by(list(self_keys)).agg(pl.len().alias("n"))["n"].to_numpy()
-    n_max = max(50, int(np.percentile(sizes, 95)))
+    preds = per_bip_predictors(bbe, s, l, beta_tango)
+    bbe = bbe.with_columns([pl.Series(k, v) for k, v in preds.items()])
+
+    counts = bbe.group_by(list(self_keys)).agg(pl.len().alias("N"))
+    cohort = counts.filter(pl.col("N") >= min_bip_pool).select(list(self_keys))
+    n_pool = cohort.height
+    if n_pool < 5:
+        print(f"  α plot: only {n_pool} groups have ≥{min_bip_pool} BIPs; skipping",
+              file=sys.stderr)
+        return
+    bbe = bbe.join(cohort, on=list(self_keys), how="inner")
+
+    grouped = bbe.group_by(list(self_keys), maintain_order=True).agg(
+        [pl.col(name).alias(name) for name in ordered_names]
+    )
+
+    # Sub-sample the n grid on a logish spacing so the curve is fast to render
+    # while keeping every point at small n where reliability moves fastest.
+    ns_dense  = np.arange(2, min(50, min_bip_pool) + 1)
+    if min_bip_pool > 50:
+        ns_sparse = np.unique(np.geomspace(51, min_bip_pool, num=200).astype(int))
+        ns = np.concatenate([ns_dense, ns_sparse])
+    else:
+        ns = ns_dense
 
     fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
-    for name in ordered_names:
-        per = test_p.group_by(list(self_keys)).agg(
-            pl.len().alias("n"),
-            pl.col(name).mean().alias("mean"),
-            pl.col(name).var(ddof=1).alias("var"),
-        )
-        ns, alphas = alpha_curve(per, n_max=n_max)
-        ax.plot(ns, alphas, label=name, linewidth=1.5)
+    linestyles = ["-", "--", "-.", ":"]
+    final_pts: list[tuple[str, float, tuple]] = []
+    for i, name in enumerate(ordered_names):
+        vals_per_group = [np.asarray(v, dtype=np.float64)
+                          for v in grouped[name].to_list()]
+        alphas = chronological_alpha_curve(vals_per_group, ns)
+        finite = np.isfinite(alphas)
+        if not finite.any():
+            continue
+        last = float(alphas[finite][-1])
+        line, = ax.plot(ns[finite], alphas[finite],
+                        label=f"{name} (α={last:.2f})",
+                        linewidth=1.2,
+                        linestyle=linestyles[i % len(linestyles)])
+        final_pts.append((name, last, line.get_color()))
 
     for thr in (0.5, 0.7):
         ax.axhline(thr, color="gray", linestyle=":", linewidth=0.8)
-    ax.set_xlabel("Number of BIP per group (n)")
+    ax.set_xlabel("BIP accumulated chronologically per group (n)")
     ax.set_ylabel("Cronbach's α (reliability)")
-    ax.set_title(title)
-    ax.set_ylim(0, 1)
-    ax.set_xlim(1, n_max)
-    ax.grid(alpha=0.3)
+    ax.set_title(f"{title}\n(cohort: {n_pool} groups with ≥{min_bip_pool} career BIPs, 2016-2025)")
+    ax.set_ylim(-0.02, 1.0)
+    ax.set_xlim(1, min_bip_pool * 1.08)
+    ax.grid(alpha=0.3, which="both")
     ax.legend(loc="lower right", fontsize=9, ncol=2)
+    x_anchor = min_bip_pool
+    for name, y, color in final_pts:
+        ax.annotate(name, xy=(x_anchor, y), xytext=(4, 0),
+                    textcoords="offset points", fontsize=7, color=color,
+                    va="center")
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
@@ -418,10 +507,11 @@ def render_alpha_plot(test: pl.DataFrame, self_keys, s, l, beta_tango,
 # --- Main ---
 
 def run_grain(loader, out_filename: str, alpha_filename: str | None = None,
+              alpha_min_bip_pool: int = 1000,
               top_bottom_year: int | None = None,
               top_bottom_min: int | None = None,
               top_bottom_filename: str | None = None) -> None:
-    train_full, test, test_next, group_keys, self_keys, header_tmpl, test_alpha = loader()
+    train_full, test, test_next, group_keys, self_keys, header_tmpl, alpha_bbe = loader()
 
     # --- Train models ---
     print("Training splines + LGBM ...", file=sys.stderr, flush=True)
@@ -568,13 +658,12 @@ def run_grain(loader, out_filename: str, alpha_filename: str | None = None,
         print(f"saved {top_bottom_filename}")
 
     if alpha_filename is not None:
-        n_alpha_groups = test_alpha.select(list(self_keys)).unique().height
         render_alpha_plot(
-            test_alpha, self_keys, s, l, beta_tango,
+            alpha_bbe, self_keys, s, l, beta_tango,
             ordered_names=[r["name"] for r in rows if r["name"] not in ("gam", "lgbm", "naive")],
             out_path=art / alpha_filename,
-            title=(f"{TEST_N_YEAR} BBE, no IP/BIP filter "
-                   f"(n={n_alpha_groups} groups)\nCronbach's α by BIP per group"),
+            title=("Chronological Cronbach's α accrual"),
+            min_bip_pool=alpha_min_bip_pool,
         )
         print(f"saved {alpha_filename}")
 
@@ -585,6 +674,7 @@ def main() -> int:
         run_grain(lambda mb=min_bip: load_pitch_type_grain(min_bip=mb),
                   f"leaderboard_pitch_type_bip{min_bip}.txt",
                   alpha_filename="cronbach_alpha_pitch_type.png" if i == 0 else None,
+                  alpha_min_bip_pool=500,
                   top_bottom_year=2025 if min_bip == 20 else None,
                   top_bottom_min=20 if min_bip == 20 else None,
                   top_bottom_filename=("top_bottom_ensemble_pitch_type_2025_bip20.txt"
@@ -593,6 +683,7 @@ def main() -> int:
         run_grain(lambda mi=min_ip: load_pitcher_grain(min_ip=mi),
                   f"leaderboard_pitcher_year_ip{min_ip}.txt",
                   alpha_filename="cronbach_alpha_pitcher_year.png" if i == 0 else None,
+                  alpha_min_bip_pool=1500,
                   top_bottom_year=2025 if min_ip == 20 else None,
                   top_bottom_min=20 if min_ip == 20 else None,
                   top_bottom_filename=("top_bottom_ensemble_pitcher_year_2025_ip20.txt"

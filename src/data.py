@@ -17,7 +17,8 @@ ROOT = Path(__file__).resolve().parent.parent
 RAW = ROOT / "data" / "raw"
 ALL_YEARS = tuple(range(2016, 2026))
 
-KEEP_COLS = ["pitcher_id", "year", "launch_speed", "launch_angle",
+KEEP_COLS = ["pitcher_id", "year", "game_date", "ab_number", "index_play",
+             "pitch_type", "launch_speed", "launch_angle",
              "event_type", "xwoba_value"]
 
 
