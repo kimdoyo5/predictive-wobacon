@@ -470,9 +470,8 @@ def render_alpha_plot(bbe: pl.DataFrame, self_keys, s, l, beta_tango,
         ns = ns_dense
 
     fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
-    linestyles = ["-", "--", "-.", ":"]
     final_pts: list[tuple[str, float, tuple]] = []
-    for i, name in enumerate(ordered_names):
+    for name in ordered_names:
         vals_per_group = [np.asarray(v, dtype=np.float64)
                           for v in grouped[name].to_list()]
         alphas = chronological_alpha_curve(vals_per_group, ns)
@@ -482,8 +481,7 @@ def render_alpha_plot(bbe: pl.DataFrame, self_keys, s, l, beta_tango,
         last = float(alphas[finite][-1])
         line, = ax.plot(ns[finite], alphas[finite],
                         label=f"{name} (α={last:.2f})",
-                        linewidth=1.2,
-                        linestyle=linestyles[i % len(linestyles)])
+                        linewidth=1.2, linestyle="-")
         final_pts.append((name, last, line.get_color()))
 
     for thr in (0.5, 0.7):
