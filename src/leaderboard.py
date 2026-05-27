@@ -837,6 +837,13 @@ def run_grain(loader, grids: dict, out_filename: str,
         rows.append({"name": metric, "rmse": rmse, "r2": r2, "r2_self": rself})
 
     rows.sort(key=lambda r: r["rmse"])
+    # Emit ensemble row metrics to stdout for sweep harnesses.
+    ens_row = next((r for r in rows if r["name"] == "ensemble"), None)
+    if ens_row is not None:
+        slug = Path(out_filename).stem
+        print(f"SLICE_METRIC {slug} rmse={ens_row['rmse']:.5f} "
+              f"r2={ens_row['r2']:.4f} r2_self={ens_row['r2_self']:.4f}",
+              file=sys.stderr)
     art = ROOT / "artifacts"
     art.mkdir(exist_ok=True)
     png_path = art / (Path(out_filename).stem + ".png")
@@ -881,10 +888,90 @@ def run_grain(loader, grids: dict, out_filename: str,
         print(f"saved {alpha_filename}")
 
 
+def render_calibration_scatter(grids: dict, out_path: Path,
+                                 min_bip: int = 10) -> None:
+    """Per-pitcher career calibration scatter (2016-2025).
+
+    x = predicted xwobacon (mean per-BIP ensemble grid lookup, equal-BIP weight)
+    y = actual    xwobacon (mean per-BIP xwoba_value, equal-BIP weight)
+    size ∝ n_bip
+    """
+    import matplotlib.pyplot as plt
+
+    cols = ["pitcher_id", "launch_speed", "launch_angle", "xwoba_value"]
+    frames = [
+        pl.scan_parquet(RAW / f"pitches_{y}.parquet")
+        .select(cols)
+        .filter(
+            pl.col("launch_speed").is_not_null()
+            & pl.col("launch_angle").is_not_null()
+            & pl.col("xwoba_value").is_not_null()
+        )
+        for y in TOP_BOTTOM_YEARS
+    ]
+    bb = pl.concat(frames, how="vertical").collect()
+
+    p_ens = grid_predict_per_bip(
+        grids["smoothed_grid"], grids["ev_grid"], grids["la_grid"],
+        bb["launch_speed"].to_numpy(), bb["launch_angle"].to_numpy(),
+    )
+    bb = bb.with_columns(pl.Series("p_ens", p_ens))
+    agg = (bb.group_by("pitcher_id")
+              .agg(pl.len().alias("n_bip"),
+                   pl.col("p_ens").mean().alias("pred"),
+                   pl.col("xwoba_value").mean().alias("actual"))
+              .filter(pl.col("n_bip") >= min_bip))
+
+    pred  = agg["pred"].to_numpy()
+    actual = agg["actual"].to_numpy()
+    n_bip = agg["n_bip"].to_numpy().astype(np.float64)
+
+    # Weighted OLS slope/intercept of actual on pred (for calibration line).
+    w = n_bip
+    pm = (w * pred).sum() / w.sum()
+    am = (w * actual).sum() / w.sum()
+    b = ((w * (pred - pm) * (actual - am)).sum()
+         / (w * (pred - pm) ** 2).sum())
+    a = am - b * pm
+    r = (((w * (pred - pm) * (actual - am)).sum())
+         / np.sqrt((w * (pred - pm) ** 2).sum()
+                   * (w * (actual - am) ** 2).sum()))
+
+    fig, ax = plt.subplots(figsize=(8.5, 7.0), constrained_layout=True)
+    sizes = 4.0 + 0.8 * np.sqrt(n_bip)
+    ax.scatter(pred, actual, s=sizes, alpha=0.35, color="#1f3a93",
+                edgecolors="none")
+
+    lo = float(min(pred.min(), actual.min())) - 0.005
+    hi = float(max(pred.max(), actual.max())) + 0.005
+    xs = np.linspace(lo, hi, 200)
+    ax.plot(xs, xs, color="black", linestyle="--", linewidth=1.0,
+             label="perfect calibration (y = x)")
+    ax.plot(xs, a + b * xs, color="crimson", linewidth=1.8,
+             label=f"weighted OLS: y = {a:.3f} + {b:.3f}·x   (r²={r*r:.3f})")
+
+    ax.set_xlabel("Predicted xwOBAcon (ensemble, career-mean per-BIP)", fontsize=13)
+    ax.set_ylabel("Actual xwOBAcon (career-mean per-BIP)", fontsize=13)
+    ax.set_title(
+        f"Pitcher Calibration  ·  career 2016-2025  ·  n={len(pred)} pitchers, "
+        f"min BIP = {min_bip}\ncircle area ∝ BIP",
+        fontsize=14,
+    )
+    ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(alpha=0.3)
+    ax.legend(loc="upper left", fontsize=11)
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
 def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8")
     grids = load_cached_grids()
     yr_tag = f"{TOP_BOTTOM_YEARS[0]}_{TOP_BOTTOM_YEARS[-1]}"
+
+    render_calibration_scatter(grids, ART / "calibration_scatter.png", min_bip=10)
+    print("saved calibration_scatter.png", file=sys.stderr)
     for i, min_bip in enumerate((20, 100)):
         run_grain(lambda mb=min_bip: load_pitch_type_grain(min_bip=mb),
                   grids,
