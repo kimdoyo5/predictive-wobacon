@@ -36,7 +36,7 @@ MIN_IP           = 30
 MIN_BIP_TRAINVAL = int(os.environ.get("MIN_BIP_TRAINVAL", "1"))
 
 
-def load_splits() -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+def load_splits(min_ip: int = MIN_IP) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     bb = load_batted_balls()
     ps = pitcher_season_xwobacon(bb, min_bip=1)         # no filter here
     ip = pitcher_season_ip().select("pitcher_id", "year", "ip")
@@ -56,7 +56,7 @@ def load_splits() -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFram
     #                              n_bip_next, xwobacon_next, ip_next
 
     bip_ok = pl.min_horizontal("n_bip", "n_bip_next") >= MIN_BIP_TRAINVAL
-    ip_ok  = pl.min_horizontal("ip", "ip_next") >= MIN_IP
+    ip_ok  = pl.min_horizontal("ip", "ip_next") >= min_ip
     trainval  = pairs.filter(pl.col("year").is_in(list(TRAINVAL_N_YEARS)) & bip_ok)
     test_keys = pairs.filter((pl.col("year") == TEST_N_YEAR) & ip_ok)
 
