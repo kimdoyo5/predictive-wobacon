@@ -8,23 +8,15 @@ aggregated MSE loss, grouped by (pitcher_id, year):
 
 Output: equal-weight 50/50 average of the two predictions.
 
-Filters:
-  Train+val: n_bip ≥ MIN_BIP_TRAINVAL in BOTH year N and year N+1 (default 50).
-             Both subsumed into training — no val held out.
-  Test:      ip ≥ MIN_IP in both years (default 50).
-
-Reference performance (held-out 2024→2025 test, n=213 pitcher-seasons):
-  Splines: 0.02357 RMSE, r²+0.108
-  LGBM:    0.02349 RMSE, r²+0.114
-  50/50:   0.02349 RMSE, r²+0.114
+Filters and weights: see eval.load_splits (this module overrides
+MIN_BIP_TRAINVAL=50 for training; trainval = train ∪ val with no val
+held out).
 
 Usage:
-  uv run python src/ensemble.py                 # train + evaluate
-  uv run python src/ensemble.py --plot          # also render heatmap
+  uv run python src/ensemble.py   # train + evaluate + render heatmaps
 """
 from __future__ import annotations
 
-import argparse
 import os
 import sys
 import time
@@ -208,8 +200,8 @@ def render_heatmap(spline_res, lgbm_res, out_path: Path, which: str = "ensemble"
     from matplotlib import colors as mcolors
     from matplotlib.ticker import MultipleLocator
 
-    ev_grid = np.linspace(40, 120, 240)
-    la_grid = np.linspace(-60, 60, 240)
+    ev_grid = np.linspace(0, 120, 240)
+    la_grid = np.linspace(-90, 90, 240)
     # Spline predictions on grid
     B_ev = spline_res["st_ev"].transform(ev_grid.reshape(-1, 1))
     B_la = spline_res["st_la"].transform(la_grid.reshape(-1, 1))
@@ -236,7 +228,7 @@ def render_heatmap(spline_res, lgbm_res, out_path: Path, which: str = "ensemble"
     bb = load_batted_balls()
     H, xe, ye = np.histogram2d(
         bb["launch_speed"].to_numpy(), bb["launch_angle"].to_numpy(),
-        bins=[120, 120], range=[[40, 120], [-60, 60]],
+        bins=[120, 120], range=[[0, 120], [-90, 90]],
     )
     ix = np.clip(np.searchsorted(xe, ev_grid, side="right") - 1, 0, H.shape[0] - 1)
     iy = np.clip(np.searchsorted(ye, la_grid, side="right") - 1, 0, H.shape[1] - 1)
@@ -246,9 +238,9 @@ def render_heatmap(spline_res, lgbm_res, out_path: Path, which: str = "ensemble"
 
     fig, ax = plt.subplots(figsize=(10, 7), constrained_layout=True)
     league_xwobacon = 0.371
-    sup = pred[~mask]
-    vmin = float(np.percentile(sup, 1))
-    vmax = float(np.percentile(sup, 99))
+    half_range = 0.2
+    vmin = league_xwobacon - half_range
+    vmax = league_xwobacon + half_range
     norm = mcolors.TwoSlopeNorm(vmin=vmin, vcenter=league_xwobacon, vmax=vmax)
     cmap = plt.get_cmap("RdBu_r").copy(); cmap.set_bad("#dddddd")
     im = ax.pcolormesh(EV, LA, pred_m, shading="auto", cmap=cmap, norm=norm)
@@ -258,17 +250,13 @@ def render_heatmap(spline_res, lgbm_res, out_path: Path, which: str = "ensemble"
     ax.set_xlabel("Exit velocity (mph)")
     ax.set_ylabel("Launch angle (°)")
     ax.set_title(f"Pitcher-year predictive xwOBAcon: {title_model}")
-    ax.set_xlim(40, 120); ax.set_ylim(-60, 60)
+    ax.set_xlim(0, 120); ax.set_ylim(-90, 90)
     fig.savefig(out_path, dpi=150)
 
 
 # ---------- Main ----------
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--plot", action="store_true", help="render heatmap")
-    args = parser.parse_args()
-
     sys.stdout.reconfigure(encoding="utf-8")
     ART.mkdir(parents=True, exist_ok=True)
 
@@ -329,13 +317,12 @@ def main() -> int:
     np.savez(ART / "ensemble_lgbm_meta.npz", init_score=l["init_score"])
     print(f"\nsaved ensemble_splines.npz, ensemble_lgbm.txt, ensemble_lgbm_meta.npz")
 
-    if args.plot:
-        for which, fname in [("ensemble", "ensemble_heatmap.png"),
-                              ("splines",  "heatmap_gam.png"),
-                              ("lgbm",     "heatmap_lgbm.png")]:
-            out = ART / fname
-            render_heatmap(s, l, out, which=which)
-            print(f"saved {out.name}")
+    for which, fname in [("ensemble", "heatmap_ensemble.png"),
+                          ("splines",  "heatmap_gam.png"),
+                          ("lgbm",     "heatmap_lgbm.png")]:
+        out = ART / fname
+        render_heatmap(s, l, out, which=which)
+        print(f"saved {out.name}")
 
     print(f"\ntotal: {time.time()-t0:.0f}s")
     return 0

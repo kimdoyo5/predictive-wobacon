@@ -10,12 +10,10 @@ Rows: ensemble (50/50 splines + LGBM), gam, lgbm, tango, xwobacon, avg_ev,
       avg_la, hr_rate.
 
 Usage:
-  uv run python src/leaderboard.py              # pitcher-year, n=213
-  uv run python src/leaderboard.py --grain pt   # pitch-type,   n=129
+  uv run python src/leaderboard.py    # runs both grains, writes both artifacts
 """
 from __future__ import annotations
 
-import argparse
 import os
 import sys
 from pathlib import Path
@@ -33,7 +31,7 @@ from ensemble import train_splines, train_lgbm
 RAW = ROOT / "data" / "raw"
 
 # Pitch-type grain config.
-PT_MIN_BIP = 100
+PT_MIN_BIP = 20
 PT_TRAINVAL_YEARS = tuple(range(2016, 2024))
 PT_TEST_YEAR = 2024
 
@@ -129,13 +127,16 @@ def load_pitcher_grain():
     group_keys = ("pitcher_id", "year")
     self_keys  = ("pitcher_id",)   # year-N+1 alignment drops the year
     header_tmpl = ("Pitcher-year test leaderboard "
-                   "(n={n} pitchers, IP≥50 both yrs, n_bip_next weighted)")
+                   "(n={n} pitchers, IP≥30 both yrs, min(IP, IP_next) weighted)")
     return train_full, test, test_next, group_keys, self_keys, header_tmpl
 
 
 def load_pitch_type_grain():
-    """Pitch-type grain: load all BBE with pitch_type, build (N, N+1) pairs
-    with n_bip ≥ PT_MIN_BIP filter on both years.
+    """Pitch-type grain: load all BBE with pitch_type, build (N, N+1) pairs.
+
+    Both train and test filter on min(n_bip, n_bip_next) >= PT_MIN_BIP per
+    (pitcher, pitch_type). Weight (in the `n_bip_next` column) is
+    min(n_bip, n_bip_next).
     """
     frames = []
     for y in range(2016, 2026):
@@ -157,12 +158,15 @@ def load_pitch_type_grain():
     nxt = (pst.with_columns((pl.col("year") - 1).alias("year"))
               .rename({"n_bip": "n_bip_next", "xwobacon": "xwobacon_next"}))
     pairs = pst.join(nxt, on=["pitcher_id", "pitch_type", "year"], how="inner")
-    bip_ok = (pl.col("n_bip") >= PT_MIN_BIP) & (pl.col("n_bip_next") >= PT_MIN_BIP)
-    trainval  = pairs.filter(pl.col("year").is_in(list(PT_TRAINVAL_YEARS)) & bip_ok)
-    test_keys = pairs.filter((pl.col("year") == PT_TEST_YEAR) & bip_ok)
 
-    target_cols = pairs.select("pitcher_id", "pitch_type", "year",
-                                "xwobacon_next", "n_bip_next")
+    bip_min_ok = pl.min_horizontal("n_bip", "n_bip_next") >= PT_MIN_BIP
+    trainval  = pairs.filter(pl.col("year").is_in(list(PT_TRAINVAL_YEARS)) & bip_min_ok)
+    test_keys = pairs.filter((pl.col("year") == PT_TEST_YEAR) & bip_min_ok)
+
+    target_cols = pairs.select(
+        "pitcher_id", "pitch_type", "year", "xwobacon_next",
+        pl.min_horizontal("n_bip", "n_bip_next").alias("n_bip_next"),
+    )
     bbe_all = bb.join(target_cols, on=["pitcher_id", "pitch_type", "year"], how="inner")
     train_full = bbe_all.join(trainval.select("pitcher_id", "pitch_type", "year"),
                                on=["pitcher_id", "pitch_type", "year"], how="inner")
@@ -176,25 +180,14 @@ def load_pitch_type_grain():
     self_keys  = ("pitcher_id", "pitch_type")
     header_tmpl = ("Pitcher × pitch_type × year test leaderboard "
                    f"(n={{n}} (pitcher, pitch_type) combos, "
-                   f"BIP≥{PT_MIN_BIP} both yrs, n_bip_next weighted)")
+                   f"min(n_bip, n_bip_next)≥{PT_MIN_BIP}, min(n_bip, n_bip_next) weighted)")
     return train_full, test, test_next, group_keys, self_keys, header_tmpl
 
 
 # --- Main ---
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--grain", choices=["pitcher", "pt"], default="pitcher",
-                        help="pitcher-year (default) or pitcher × pitch_type × year")
-    args = parser.parse_args()
-    sys.stdout.reconfigure(encoding="utf-8")
-
-    if args.grain == "pitcher":
-        train_full, test, test_next, group_keys, self_keys, header_tmpl = \
-            load_pitcher_grain()
-    else:
-        train_full, test, test_next, group_keys, self_keys, header_tmpl = \
-            load_pitch_type_grain()
+def run_grain(loader, out_filename: str) -> None:
+    train_full, test, test_next, group_keys, self_keys, header_tmpl = loader()
 
     # --- Train models ---
     print("Training splines + LGBM ...", file=sys.stderr, flush=True)
@@ -291,13 +284,28 @@ def main() -> int:
         rself = weighted_corr(x_n[ok], x_n1[ok], w_te[ok]) ** 2
         rows.append({"name": metric, "rmse": rmse, "r2": r2, "r2_self": rself})
 
-    # --- Print ---
+    # --- Print + write artifact ---
     rows.sort(key=lambda r: r["rmse"])
-    print(f"\n{header_tmpl.format(n=len(y_te))}")
-    print(f"{'rank':>4}  {'name':<12s}  {'rmse':>8s}  {'r²':>8s}  {'r² (self)':>10s}")
-    print("-" * 50)
+    lines = [
+        "",
+        header_tmpl.format(n=len(y_te)),
+        f"{'rank':>4}  {'name':<12s}  {'rmse':>8s}  {'r²':>8s}  {'r² (self)':>10s}",
+        "-" * 50,
+    ]
     for i, r in enumerate(rows, 1):
-        print(f"{i:>4}  {r['name']:<12s}  {r['rmse']:.5f}  {r['r2']:+.4f}  {r['r2_self']:+.6f}")
+        lines.append(f"{i:>4}  {r['name']:<12s}  {r['rmse']:.5f}  {r['r2']:+.4f}  {r['r2_self']:+.6f}")
+    out = "\n".join(lines) + "\n"
+    print(out, end="")
+
+    art = ROOT / "artifacts"
+    art.mkdir(exist_ok=True)
+    (art / out_filename).write_text(out, encoding="utf-8")
+
+
+def main() -> int:
+    sys.stdout.reconfigure(encoding="utf-8")
+    run_grain(load_pitcher_grain,    "leaderboard_pitcher_year.txt")
+    run_grain(load_pitch_type_grain, "leaderboard_pitch_type.txt")
     return 0
 
 

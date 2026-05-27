@@ -1,12 +1,16 @@
-"""Shared train/val/test split + BIP-weighted metrics.
+"""Shared train/val/test split + min-of-pair-weighted metrics.
 
 TEST is held out chronologically: N = 2024 → 2024->2025 target.
 TRAIN/VAL pool is N in 2016..2023, then split RANDOMLY by (pitcher, year)
 pair into train (80%) and val (20%) with a fixed seed.
 
 Filters:
-    train, val:  n_bip >= MIN_BIP_TRAINVAL in both N and N+1 (env-tunable).
-    test:        ip >= MIN_IP AND ip_next >= MIN_IP.
+    train, val:  min(n_bip, n_bip_next) >= MIN_BIP_TRAINVAL (env-tunable).
+    test:        min(ip, ip_next) >= MIN_IP.
+
+Weights (stored in the `n_bip_next` column for downstream compatibility):
+    train, val:  min(n_bip, n_bip_next).
+    test:        min(ip, ip_next).
 
 load_splits() returns (train, val, test, test_next):
     train, val, test:  year-N BBE rows with target/IP columns attached.
@@ -28,7 +32,7 @@ TEST_N_YEAR      = 2024
 VAL_FRAC = 0.20
 SEED     = 42
 
-MIN_IP           = 50
+MIN_IP           = 30
 MIN_BIP_TRAINVAL = int(os.environ.get("MIN_BIP_TRAINVAL", "1"))
 
 
@@ -51,9 +55,8 @@ def load_splits() -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFram
     # pairs: pitcher_id, year(N), n_bip, xwobacon, ip,
     #                              n_bip_next, xwobacon_next, ip_next
 
-    bip_ok = ((pl.col("n_bip") >= MIN_BIP_TRAINVAL)
-              & (pl.col("n_bip_next") >= MIN_BIP_TRAINVAL))
-    ip_ok  = (pl.col("ip") >= MIN_IP) & (pl.col("ip_next") >= MIN_IP)
+    bip_ok = pl.min_horizontal("n_bip", "n_bip_next") >= MIN_BIP_TRAINVAL
+    ip_ok  = pl.min_horizontal("ip", "ip_next") >= MIN_IP
     trainval  = pairs.filter(pl.col("year").is_in(list(TRAINVAL_N_YEARS)) & bip_ok)
     test_keys = pairs.filter((pl.col("year") == TEST_N_YEAR) & ip_ok)
 
@@ -65,16 +68,27 @@ def load_splits() -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFram
     val_keys   = trainval[np.sort(perm[:n_val])].select("pitcher_id", "year")
     train_keys = trainval[np.sort(perm[n_val:])].select("pitcher_id", "year")
 
-    # Attach target/IP to per-event BBE rows.
-    target_cols = pairs.select("pitcher_id", "year",
-                               "xwobacon_next", "n_bip_next",
-                               "ip", "ip_next")
-    bbe_all = bb.join(target_cols, on=["pitcher_id", "year"], how="inner")
+    # Attach target + weight to per-event BBE rows. The `n_bip_next` column
+    # stores the *weight* (downstream code reads it as the row weight):
+    #   train/val: min(n_bip, n_bip_next) — effective-sample weighting.
+    #   test:      min(ip, ip_next)       — leaderboard metric weight.
+    target_cols_trainval = pairs.select(
+        "pitcher_id", "year", "xwobacon_next",
+        pl.min_horizontal("n_bip", "n_bip_next").alias("n_bip_next"),
+        "ip", "ip_next",
+    )
+    target_cols_test = pairs.select(
+        "pitcher_id", "year", "xwobacon_next",
+        pl.min_horizontal("ip", "ip_next").alias("n_bip_next"),
+        "ip", "ip_next",
+    )
+    bbe_trainval = bb.join(target_cols_trainval, on=["pitcher_id", "year"], how="inner")
+    bbe_test     = bb.join(target_cols_test,     on=["pitcher_id", "year"], how="inner")
 
-    train = bbe_all.join(train_keys, on=["pitcher_id", "year"], how="inner")
-    val   = bbe_all.join(val_keys,   on=["pitcher_id", "year"], how="inner")
-    test  = bbe_all.join(test_keys.select("pitcher_id", "year"),
-                         on=["pitcher_id", "year"], how="inner")
+    train = bbe_trainval.join(train_keys, on=["pitcher_id", "year"], how="inner")
+    val   = bbe_trainval.join(val_keys,   on=["pitcher_id", "year"], how="inner")
+    test  = bbe_test.join(test_keys.select("pitcher_id", "year"),
+                          on=["pitcher_id", "year"], how="inner")
 
     # test_next: year-(N+1)=2025 BBE for the SAME test pitchers.
     test_pitcher_ids = test_keys.select("pitcher_id")
