@@ -2,13 +2,14 @@
 
 Columns (BIP-weighted on the held-out 2024 → 2025 test set):
   rmse       — RMSE on year-N+1 xwobacon prediction
-  r²         — corr²(predictor, target); the linear-calibration-free ceiling
-               (== r²(self) by construction for univariate predictors equal to the target).
-  r² (self)  — corr²(predictor_n, predictor_n+1); year-to-year stability.
+  r          — corr(predictor, target); the linear-calibration-free ceiling
+               (== r(self) by construction for univariate predictors equal to the target).
+  r (self)   — corr(predictor_n, predictor_n+1); year-to-year stability.
 
 Rows: ensemble (smoothed 50/50 splines + LGBM — the production model
       defined in src/ensemble.py), gam, lgbm, pwobacon, xwobacon, avg_ev,
-      avg_la, hr_rate, naive (constant training-mean target).
+      avg_la, naive (constant training-mean target). At pitcher-year grain
+      only: K%, BB%, HR% (PA-level rates, shown for self-stability only).
 
 Usage:
   uv run python src/leaderboard.py    # runs both grains, writes both artifacts
@@ -29,7 +30,7 @@ import importlib, eval as eval_mod; importlib.reload(eval_mod)
 from eval import load_splits, weighted_rmse, weighted_corr, TEST_N_YEAR
 from ensemble import (grid_predict_per_bip, grid_predict_per_group,
                        SMOOTH_SIGMA_EV, SMOOTH_SIGMA_LA)
-from data import load_batted_balls, pitcher_season_ip
+from data import load_batted_balls, pitcher_season_ip, pitcher_season_pa_rates
 
 ART = ROOT / "artifacts"
 RAW = ROOT / "data" / "raw"
@@ -81,7 +82,9 @@ PT_MIN_BIP = 20
 PT_TRAINVAL_YEARS = tuple(range(2016, 2024))
 PT_TEST_YEAR = 2024
 
-METRICS = ["xwobacon", "avg_ev", "avg_la", "hr_rate"]
+METRICS = ["xwobacon", "avg_ev", "avg_la"]
+# PA-level rates (per plate appearance). Only meaningful at pitcher-year grain.
+PA_METRICS = ["k_pct", "bb_pct", "hr_pct"]
 
 
 # --- pwobacon 12-bucket OLS (3 LA × 4 EV) ---
@@ -142,13 +145,12 @@ def pwobacon_fit(train_full: pl.DataFrame, group_keys) -> np.ndarray:
 # --- Univariate per-season metrics ---
 
 def season_metrics(bbe: pl.DataFrame, group_keys) -> pl.DataFrame:
-    """Per group: n_bip, xwobacon, avg_ev, avg_la, hr_rate."""
+    """Per group: n_bip, xwobacon, avg_ev, avg_la."""
     return bbe.group_by(list(group_keys)).agg(
         pl.len().alias("n_bip"),
         pl.col("xwoba_value").mean().alias("xwobacon"),
         pl.col("launch_speed").mean().alias("avg_ev"),
         pl.col("launch_angle").mean().alias("avg_la"),
-        (pl.col("event_type") == "home_run").mean().alias("hr_rate"),
     ).sort(*group_keys)
 
 
@@ -237,7 +239,7 @@ def load_pitch_type_grain(min_bip: int = PT_MIN_BIP):
     group_keys = ("pitcher_id", "pitch_type", "year")
     self_keys  = ("pitcher_id", "pitch_type")
     png_main = f"{TEST_N_YEAR} Correlation to {TEST_N_YEAR + 1}"
-    png_sub  = (f"Pitcher × Pitch Type  ·  n={{n}} combos  ·  "
+    png_sub  = (f"Pitcher × Pitch Type × Year  ·  n={{n}} combos  ·  "
                 f"min(n_bip, n_bip_next) ≥ {min_bip}, weighted")
     return (train_full, test, test_next, group_keys, self_keys,
             (png_main, png_sub), alpha_bbe)
@@ -267,7 +269,6 @@ def per_bip_predictors(test: pl.DataFrame, grids: dict,
         "xwobacon": test["xwoba_value"].to_numpy(),
         "avg_ev":   evs,
         "avg_la":   las,
-        "hr_rate":  (test["event_type"] == "home_run").to_numpy().astype(np.float64),
     }
 
 
@@ -449,7 +450,9 @@ def _display_name(name: str) -> str:
         "xwobacon": "xwOBAcon",
         "avg_ev":   "Avg EV",
         "avg_la":   "Avg LA",
-        "hr_rate":  "HR rate",
+        "k_pct":    "K%",
+        "bb_pct":   "BB%",
+        "hr_pct":   "HR%",
         "naive":    "Naive",
     }
     if name in mapping:
@@ -539,8 +542,8 @@ def render_main_leaderboard_png(main_title: str, subtitle: str,
     """
     import matplotlib.pyplot as plt
 
-    col_labels = ["#", "Model", "RMSE", "r²(xwOBAcon)", "r² (self)"]
-    col_widths = [0.06, 0.36, 0.14, 0.25, 0.19]
+    col_labels = ["#", "Model", "RMSE", "xwOBAcon", "Self"]
+    col_widths = [0.06, 0.37, 0.19, 0.19, 0.19]
 
     cell_text: list[list[str]] = []
     bold_rows: set[int] = set()
@@ -548,20 +551,20 @@ def render_main_leaderboard_png(main_title: str, subtitle: str,
         cell_text.append([
             str(i + 1),
             _display_name(r["name"]),
-            f"{r['rmse']:.4f}",
-            "—" if not np.isfinite(r["r2"])      else f"{r['r2']:.3f}",
-            "—" if not np.isfinite(r["r2_self"]) else f"{r['r2_self']:.3f}",
+            "—" if not np.isfinite(r["rmse"])   else f"{r['rmse']:.4f}",
+            "—" if not np.isfinite(r["r"])      else f"{r['r']:.3f}",
+            "—" if not np.isfinite(r["r_self"]) else f"{r['r_self']:.3f}",
         ])
         if r["name"].startswith("ensemble") or r["name"] == "xwobacon":
             bold_rows.add(i)
 
     n = len(rows)
     row_h = 0.36
-    fig_w = 5.6
-    fig_h = TITLE_BLOCK_IN + row_h * (n + 1) + 0.18
+    fig_w = 4.8
+    fig_h = TITLE_BLOCK_IN + row_h * (n + 1) + 0.12
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=PNG_DPI)
     ax.set_axis_off()
-    ax.set_position([0.03, 0.04, 0.94, 1 - (TITLE_BLOCK_IN / fig_h) - 0.04])
+    ax.set_position([0.02, 0.03, 0.96, 1 - (TITLE_BLOCK_IN / fig_h) - 0.03])
 
     table = ax.table(
         cellText=cell_text,
@@ -582,7 +585,7 @@ def render_main_leaderboard_png(main_title: str, subtitle: str,
 
     _draw_title_block(fig, main_title, subtitle)
     fig.savefig(out_path, dpi=PNG_DPI, bbox_inches="tight",
-                facecolor="white", pad_inches=0.18)
+                facecolor="white", pad_inches=0.08)
     plt.close(fig)
 
 
@@ -771,11 +774,11 @@ def run_grain(loader, grids: dict, out_filename: str,
         ok = np.isfinite(pred_n) & np.isfinite(pred_n1)
         rmse = weighted_rmse(y_te[ok], pred_n[ok], w_te[ok])
         if np.ptp(pred_n[ok]) == 0 or np.ptp(pred_n1[ok]) == 0:
-            r2 = rself = float("nan")  # constant predictor — corr undefined
+            r_val = rself = float("nan")  # constant predictor — corr undefined
         else:
-            r2    = weighted_corr(pred_n[ok], y_te[ok], w_te[ok]) ** 2
-            rself = weighted_corr(pred_n[ok], pred_n1[ok], w_te[ok]) ** 2
-        rows.append({"name": name, "rmse": rmse, "r2": r2, "r2_self": rself})
+            r_val = weighted_corr(pred_n[ok], y_te[ok], w_te[ok])
+            rself = weighted_corr(pred_n[ok], pred_n1[ok], w_te[ok])
+        rows.append({"name": name, "rmse": rmse, "r": r_val, "r_self": rself})
 
     add("ensemble", pred_ens, pred_ens_n1)
     add("gam",      pred_gam, pred_gam_n1)
@@ -810,39 +813,60 @@ def run_grain(loader, grids: dict, out_filename: str,
     nxt_target = (train_full.unique(list(group_keys))
                             .select([*group_keys, "xwobacon_next", "n_bip_next"]))
     pst_trv = pst_trv.join(nxt_target, on=list(group_keys), how="inner")
-    y_trv = pst_trv["xwobacon_next"].to_numpy()
-    w_trv = pst_trv["n_bip_next"].to_numpy().astype(np.float64)
 
     pst_te    = season_metrics(test,      group_keys)
     pst_te_n1 = season_metrics(test_next, self_keys)  # drop "year" for alignment
+
+    # PA-level baselines (K%, BB%, HR%) — only at pitcher-year grain.
+    metrics_iter = list(METRICS)
+    if group_keys == ("pitcher_id", "year"):
+        pa_rates = pitcher_season_pa_rates()
+        pa_n  = pa_rates.select(["pitcher_id", "year", *PA_METRICS])
+        pa_n1 = (pa_rates.filter(pl.col("year") == TEST_N_YEAR + 1)
+                          .select(["pitcher_id", *PA_METRICS]))
+        pst_trv   = pst_trv.join(pa_n,   on=["pitcher_id", "year"], how="left")
+        pst_te    = pst_te.join(pa_n,    on=["pitcher_id", "year"], how="left")
+        pst_te_n1 = pst_te_n1.join(pa_n1, on=["pitcher_id"], how="left")
+        metrics_iter.extend(PA_METRICS)
+
+    y_trv = pst_trv["xwobacon_next"].to_numpy()
+    w_trv = pst_trv["n_bip_next"].to_numpy().astype(np.float64)
     paired_n = grp_te.select(list(group_keys)).join(
-        pst_te.select([*group_keys, *METRICS]),
+        pst_te.select([*group_keys, *metrics_iter]),
         on=list(group_keys), how="left",
     )
     paired_n1 = grp_te.select(list(self_keys)).join(
-        pst_te_n1.select([*self_keys, *METRICS]),
+        pst_te_n1.select([*self_keys, *metrics_iter]),
         on=list(self_keys), how="left",
     )
 
-    for metric in METRICS:
-        x_trv = pst_trv[metric].to_numpy()
-        a, b = fit_univariate(x_trv, y_trv, w_trv)
+    for metric in metrics_iter:
         x_n  = paired_n[metric].to_numpy()
         x_n1 = paired_n1[metric].to_numpy()
-        yhat_n = a + b * x_n
-        ok = np.isfinite(yhat_n) & np.isfinite(x_n1)
-        rmse  = weighted_rmse(y_te[ok], yhat_n[ok], w_te[ok])
-        r2    = weighted_corr(x_n[ok], y_te[ok], w_te[ok]) ** 2
-        rself = weighted_corr(x_n[ok], x_n1[ok], w_te[ok]) ** 2
-        rows.append({"name": metric, "rmse": rmse, "r2": r2, "r2_self": rself})
+        if metric in PA_METRICS:
+            # PA-level rates aren't in xwobacon units, so RMSE and
+            # corr(x, xwobacon) aren't meaningful — only self-stability is.
+            rmse  = float("nan")
+            r_val = float("nan")
+        else:
+            x_trv = pst_trv[metric].to_numpy()
+            a, b = fit_univariate(x_trv, y_trv, w_trv)
+            yhat_n = a + b * x_n
+            ok_y   = np.isfinite(yhat_n) & np.isfinite(x_n1)
+            rmse   = weighted_rmse(y_te[ok_y], yhat_n[ok_y], w_te[ok_y])
+            r_val  = weighted_corr(x_n[ok_y], y_te[ok_y], w_te[ok_y])
+        ok_self = np.isfinite(x_n) & np.isfinite(x_n1)
+        rself = weighted_corr(x_n[ok_self], x_n1[ok_self], w_te[ok_self])
+        rows.append({"name": metric, "rmse": rmse, "r": r_val, "r_self": rself})
 
-    rows.sort(key=lambda r: r["rmse"])
+    # NaN rmse rows (the PA-level baselines) sort to the bottom.
+    rows.sort(key=lambda r: (not np.isfinite(r["rmse"]), r["rmse"]))
     # Emit ensemble row metrics to stdout for sweep harnesses.
     ens_row = next((r for r in rows if r["name"] == "ensemble"), None)
     if ens_row is not None:
         slug = Path(out_filename).stem
         print(f"SLICE_METRIC {slug} rmse={ens_row['rmse']:.5f} "
-              f"r2={ens_row['r2']:.4f} r2_self={ens_row['r2_self']:.4f}",
+              f"r={ens_row['r']:.4f} r_self={ens_row['r_self']:.4f}",
               file=sys.stderr)
     art = ROOT / "artifacts"
     art.mkdir(exist_ok=True)
@@ -875,8 +899,9 @@ def run_grain(loader, grids: dict, out_filename: str,
 
     if alpha_filename is not None:
         # α plot has always omitted gam/lgbm/naive — show ensemble + the
-        # univariate baselines + pwobacon.
-        alpha_skip = {"gam", "lgbm", "naive"}
+        # univariate baselines + pwobacon. PA-level rates (K%/BB%/HR%) are
+        # per-PA, not per-BIP, so they can't be plotted on the BIP-accrual axis.
+        alpha_skip = {"gam", "lgbm", "naive", *PA_METRICS}
         render_alpha_plot(
             alpha_bbe, self_keys, grids, beta_pwobacon,
             ordered_names=[r["name"] for r in rows

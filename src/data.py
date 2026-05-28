@@ -83,6 +83,42 @@ OUTS_PER_EVENT = {
 }
 
 
+PA_K_EVENTS  = ("strikeout", "strikeout_double_play", "strikeout_triple_play")
+PA_BB_EVENTS = ("walk", "intent_walk")
+
+
+def pitcher_season_pa_rates(years: tuple[int, ...] = ALL_YEARS) -> pl.DataFrame:
+    """Per (pitcher_id, year): n_pa, k_pct, bb_pct, hr_pct.
+
+    PA = count of non-null event_type rows (one per plate appearance).
+    Intentional walks count toward BB%; HBP does not.
+    """
+    frames = [
+        pl.scan_parquet(RAW / f"pitches_{y}.parquet")
+        .select("pitcher_id", "year", "event_type")
+        .filter(pl.col("event_type").is_not_null())
+        for y in years
+    ]
+    return (
+        pl.concat(frames, how="vertical")
+        .collect()
+        .group_by("pitcher_id", "year")
+        .agg(
+            pl.len().alias("n_pa"),
+            pl.col("event_type").is_in(list(PA_K_EVENTS)).sum().alias("n_k"),
+            pl.col("event_type").is_in(list(PA_BB_EVENTS)).sum().alias("n_bb"),
+            (pl.col("event_type") == "home_run").sum().alias("n_hr"),
+        )
+        .with_columns(
+            (pl.col("n_k")  / pl.col("n_pa")).alias("k_pct"),
+            (pl.col("n_bb") / pl.col("n_pa")).alias("bb_pct"),
+            (pl.col("n_hr") / pl.col("n_pa")).alias("hr_pct"),
+        )
+        .select("pitcher_id", "year", "n_pa", "k_pct", "bb_pct", "hr_pct")
+        .sort("pitcher_id", "year")
+    )
+
+
 def pitcher_season_ip(years: tuple[int, ...] = ALL_YEARS) -> pl.DataFrame:
     """Per (pitcher_id, year): outs and IP from event_type counts.
     Ignores pickoff/CS credited to the pitcher (rare).
