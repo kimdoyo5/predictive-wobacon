@@ -10,6 +10,10 @@ artifacts/
 # uv lock — opt back in if you want pinned deps in version control
 uv.lock
 
+# local scratch / coordination (kept on disk, not tracked)
+backprop.md
+SPEC.md
+
 # editors / OS / tooling
 .vscode/
 .idea/
