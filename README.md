@@ -25,6 +25,32 @@ uv run python src/leaderboard.py     # score baselines + render charts (~1 min)
 
 Everything downstream reads the one cached grid — no retraining — so iterating on metrics and charts is cheap.
 
+## The group-aggregated objective
+
+LightGBM optimizes a sum of *per-sample* losses and wants a gradient and Hessian for each batted ball. But the target lives at the *group* level — a pitcher-season is scored by the **mean** of its per-ball predictions, not ball by ball — and weighting balls equally would let high-volume pitchers dominate the fit. So the loss is defined on group means and backpropagated to events.
+
+Let ball $e$ belong to group $p$ (a pitcher-year) with $N_p$ balls, weight $w_p$, and next-year target $y_p$. LightGBM's raw output for a ball is $f_e$, and the group prediction is their mean:
+
+$$m_p = \frac{1}{N_p}\sum_{e \in p} f_e, \qquad L = \sum_p w_p\,(m_p - y_p)^2 .$$
+
+At the group level the gradient and curvature are immediate:
+
+$$\frac{\partial L}{\partial m_p} = 2 w_p (m_p - y_p), \qquad \frac{\partial^2 L}{\partial m_p^2} = 2 w_p .$$
+
+Since $\partial m_p / \partial f_e = 1/N_p$, the chain rule gives the per-ball gradient:
+
+$$g_e = \frac{\partial L}{\partial f_e} = \frac{\partial L}{\partial m_p}\cdot\frac{1}{N_p} = \frac{2 w_p (m_p - y_p)}{N_p} .$$
+
+For the Hessian we **spread the group curvature evenly** over its balls, rather than take the naive per-ball second derivative $\big(\partial^2 L/\partial f_e^2 = 2 w_p / N_p^2\big)$:
+
+$$h_e = \frac{1}{N_p}\frac{\partial^2 L}{\partial m_p^2} = \frac{2 w_p}{N_p} .$$
+
+This is the deliberate part. A boosting leaf that covers all $N_p$ balls of a group takes the Newton step
+
+$$-\frac{\sum_{e \in p} g_e}{\sum_{e \in p} h_e} = -\frac{2 w_p (m_p - y_p)}{2 w_p} = -(m_p - y_p),$$
+
+moving the group mean exactly onto its target. Because the per-ball Hessians sum back to the group curvature, $\sum_{e \in p} h_e = \partial^2 L/\partial m_p^2$, tree-wise Newton updates behave as if they were optimizing the per-pitcher means directly. (See `lgbm_aggregated_objective` in `src/ensemble.py`.)
+
 ## The calibration trick
 
 Raw grid predictions are far too compressed toward the league mean (calibration slope ≈ 2.3). But a pitcher's grid-average is a *noisy* estimate whose noise shrinks with sample size, so the right amount of decompression depends on how many batted balls back it:
