@@ -108,7 +108,7 @@ def fetch_year(year: int) -> None:
                       f"({time.time()-t0:.0f}s)", file=sys.stderr, flush=True)
 
     if not frames:
-        print(f"[{year}] no data — skipping write", file=sys.stderr)
+        print(f"[{year}] no data, skipping write", file=sys.stderr)
         return
 
     df = pl.concat(frames, how="diagonal_relaxed")

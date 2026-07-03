@@ -2,9 +2,9 @@
 
 **Projecting a pitcher's next-year contact quality from exit velocity and launch angle alone.**
 
-`xwOBAcon` is expected wOBA on contact — Statcast's `estimated_woba_using_speedangle` averaged over a pitcher's batted balls. This project predicts a pitcher's *next-year* xwOBAcon from nothing but the exit velocity (EV) and launch angle (LA) of the contact they allowed *this* year.
+`xwOBAcon` is expected wOBA on contact: Statcast's `estimated_woba_using_speedangle` averaged over a pitcher's batted balls. This project predicts a pitcher's *next-year* xwOBAcon from nothing but the exit velocity (EV) and launch angle (LA) of the contact they allowed *this* year.
 
-The entire model is a single 2-D lookup surface over (EV, LA): score every batted ball, average per pitcher, and you have a projection. No pitch type, count, spin, batter handedness, or pitcher identity — the only signal is *how a pitcher's contact is distributed in (EV, LA) space*.
+The entire model is a single 2-D lookup surface over (EV, LA): score every batted ball, average per pitcher, and you have a projection. No pitch type, count, spin, batter handedness, or pitcher identity. The only signal is *how a pitcher's contact is distributed in (EV, LA) space*.
 
 ## Quickstart
 
@@ -18,16 +18,16 @@ uv run python src/leaderboard.py     # score baselines + render charts (~1 min)
 ## How it works
 
 1. **Two component models**, both fit at the `(pitcher, year)` level so every pitcher-season counts proportionally rather than by batted-ball volume:
-   - a **GAM** — 50×50 quantile-knot B-spline tensor product over (EV, LA), P-spline penalty, fit by weighted ridge on per-group mean basis activations; and
-   - **LightGBM** — with a custom objective that aggregates per-pitch predictions to per-group means *before* computing gradients.
-2. **Ensemble grid** — average the two surfaces 50/50 on a dense 481×721 (EV, LA) mesh and Gaussian-smooth (σ = 5 mph, 5°). This cached grid *is* the production model.
+   - a **GAM**: a 50×50 quantile-knot B-spline tensor product over (EV, LA), P-spline penalty, fit by weighted ridge on per-group mean basis activations; and
+   - **LightGBM**: a custom objective that aggregates per-pitch predictions to per-group means *before* computing gradients.
+2. **Ensemble grid**: average the two surfaces 50/50 on a dense 481×721 (EV, LA) mesh and Gaussian-smooth (σ = 5 mph, 5°). This cached grid *is* the production model.
 3. **Sample-size-aware calibration** applied at prediction time (see below).
 
-Everything downstream reads the one cached grid — no retraining — so iterating on metrics and charts is cheap.
+Everything downstream reads the one cached grid (no retraining), so iterating on metrics and charts is cheap.
 
 ## The group-aggregated objective
 
-LightGBM optimizes a sum of *per-sample* losses and wants a gradient and Hessian for each batted ball. But the target lives at the *group* level — a pitcher-season is scored by the **mean** of its per-ball predictions, not ball by ball — and weighting balls equally would let high-volume pitchers dominate the fit. So the loss is defined on group means and backpropagated to events.
+LightGBM optimizes a sum of *per-sample* losses and wants a gradient and Hessian for each batted ball. But the target lives at the *group* level (a pitcher-season is scored by the **mean** of its per-ball predictions, not ball by ball), and weighting balls equally would let high-volume pitchers dominate the fit. So the loss is defined on group means and backpropagated to events.
 
 Let ball $e$ belong to group $p$ (a pitcher-year) with $N_p$ balls, weight $w_p$, and next-year target $y_p$. LightGBM's raw output for a ball is $f_e$, and the group prediction is their mean:
 
@@ -60,11 +60,11 @@ b(n) = 1 + (b_max − 1) · n / (n + n₀)     # b_max = 10, n₀ = 8000
 pred = pm + b(n) · (raw − pm)             # pm = league pred mean
 ```
 
-A single global stretch can't win everywhere — it over-corrects noisy season lines and under-corrects reliable career totals. `b(n)` decouples them: seasons (n ≈ 50–600) get b ≈ 1.1–1.6 (RMSE-optimal), while career aggregates (n ≈ 1000–5000) get b ≈ 2.5–4.5, pulling career calibration from slope 1.78 to **1.01** with neutral-to-better season RMSE.
+A single global stretch can't win everywhere: it over-corrects noisy season lines and under-corrects reliable career totals. `b(n)` decouples them: seasons (n ≈ 50–600) get b ≈ 1.1–1.6 (RMSE-optimal), while career aggregates (n ≈ 1000–5000) get b ≈ 2.5–4.5, pulling career calibration from slope 1.78 to **1.01** with neutral-to-better season RMSE.
 
 ## Results
 
-Held out chronologically — train 2016–2023, test **2024 → predict 2025**, min(IP, IP_next) ≥ 30, weighted by the min of the pair. The ensemble is benchmarked against Tango's pwOBAcon, Max's pwOBAcon+, raw xwOBAcon carryover, a per-bucket OLS, and a naive constant, at both pitcher-season and pitcher × pitch-type grains.
+Held out chronologically: train 2016–2023, test **2024 → predict 2025**, min(IP, IP_next) ≥ 30, weighted by the min of the pair. The ensemble is benchmarked against Tango's pwOBAcon, Max's pwOBAcon+, raw xwOBAcon carryover, a per-bucket OLS, and a naive constant, at both pitcher-season and pitcher × pitch-type grains.
 
 | Slice | RMSE | r | r (self) |
 |---|---|---|---|

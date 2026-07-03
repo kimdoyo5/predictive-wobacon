@@ -70,8 +70,8 @@ def load_splits(min_ip: int = MIN_IP) -> tuple[pl.DataFrame, pl.DataFrame, pl.Da
 
     # Attach target + weight to per-event BBE rows. The `n_bip_next` column
     # stores the *weight* (downstream code reads it as the row weight):
-    #   train/val: min(n_bip, n_bip_next) — effective-sample weighting.
-    #   test:      min(ip, ip_next)       — leaderboard metric weight.
+    #   train/val: min(n_bip, n_bip_next), effective-sample weighting.
+    #   test:      min(ip, ip_next), leaderboard metric weight.
     target_cols_trainval = pairs.select(
         "pitcher_id", "year", "xwobacon_next",
         pl.min_horizontal("n_bip", "n_bip_next").alias("n_bip_next"),

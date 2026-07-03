@@ -57,7 +57,7 @@ SMOOTH_SIGMA_LA = 5.0   # degrees
 #   b(n) = 1 + (STRETCH_B_MAX - 1) * n / (n + STRETCH_N0)
 # where n is the group's BIP count in the data being aggregated. A group's
 # grid-average is an estimate whose sampling noise shrinks with n, so the
-# optimal stretch grows with n — a single global b (the old b=1.3)
+# optimal stretch grows with n: a single global b (the old b=1.3)
 # over-stretches noisy small-n groups and under-stretches reliable
 # large-n ones (career calibration slope was 1.78, i.e. still ~2x too
 # compressed). With n0 >> typical season n the curve is near-linear in n
@@ -243,12 +243,12 @@ def build_smoothed_ensemble_grid(s, l, train_full: pl.DataFrame,
                                    sigma_la: float = SMOOTH_SIGMA_LA):
     """Production ensemble grid: 0.5*spline + 0.5*LGBM on (EV, LA),
     Gauss-smoothed at σ=(sigma_ev, sigma_la). The calibration stretch is
-    NOT baked into the grid — it is sample-size-dependent, so it is
+    NOT baked into the grid: it is sample-size-dependent, so it is
     applied per group at prediction time (see stretch_b /
     calibrated_grid_predict_per_group).
 
     Returns (ev_grid, la_grid, production_grid, pm) where `pm` is the
-    trainval per-group pred weighted mean — the center every stretch
+    trainval per-group pred weighted mean, the center every stretch
     pivots around, saved alongside the npz.
     """
     ev_grid, la_grid, spline_grid, lgbm_grid = _component_grids(s, l)
@@ -429,14 +429,14 @@ def main() -> int:
     print(f"  LGBM:     {rmse_l:.5f}, r²={r2_l:+.4f}")
     print(f"  Ensemble: {rmse_e:.5f}, r²={r2_e:+.4f}")
 
-    # Compute the un-smoothed component grids — needed both for heatmaps and
+    # Compute the un-smoothed component grids, needed both for heatmaps and
     # for downstream consumers (src/leaderboard.py) that score GAM and LGBM
     # rows from cached grids instead of retraining.
     _, _, spline_grid, lgbm_grid = _component_grids(s, l)
 
     # Save the production model: smoothed (un-stretched) ensemble + un-smoothed
     # component grids on the shared (EV, LA) axes. The stretch is applied per
-    # group at prediction time; `stretch_pm` is its data-derived center —
+    # group at prediction time; `stretch_pm` is its data-derived center;
     # b_max/n0 live in code (STRETCH_B_MAX / STRETCH_N0).
     np.savez(ART / "ensemble_grid.npz",
              ev_grid=ev_grid, la_grid=la_grid,

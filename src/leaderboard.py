@@ -1,12 +1,12 @@
 """Leaderboard at pitcher-year (default) or pitcher × pitch_type × year grain.
 
 Columns (BIP-weighted on the held-out 2024 → 2025 test set):
-  rmse       — RMSE on year-N+1 xwobacon prediction
-  r          — corr(predictor, target); the linear-calibration-free ceiling
+  rmse: RMSE on year-N+1 xwobacon prediction
+  r: corr(predictor, target); the linear-calibration-free ceiling
                (== r(self) by construction for univariate predictors equal to the target).
-  r (self)   — corr(predictor_n, predictor_n+1); year-to-year stability.
+  r (self): corr(predictor_n, predictor_n+1); year-to-year stability.
 
-Rows: ensemble (smoothed 50/50 splines + LGBM — the production model
+Rows: ensemble (smoothed 50/50 splines + LGBM, the production model
       defined in src/ensemble.py), gam, lgbm, pwobacon, xwobacon, avg_ev,
       avg_la, naive (constant training-mean target). At pitcher-year grain
       only: pwOBAcon (Max); and K%, BB%, HR% (PA-level rates, shown for
@@ -40,13 +40,13 @@ RAW = ROOT / "data" / "raw"
 
 def load_cached_grids() -> dict:
     """Load the (EV, LA) component + smoothed-ensemble grids saved by
-    src/ensemble.py — the production model. All four grain/threshold configs
+    src/ensemble.py, the production model. All four grain/threshold configs
     score against these same cached grids, so this is loaded once per run.
     """
     cache_path = ART / "ensemble_grid.npz"
     if not cache_path.exists():
         raise FileNotFoundError(
-            f"{cache_path} not found — run `uv run python src/ensemble.py` first.")
+            f"{cache_path} not found; run `uv run python src/ensemble.py` first.")
     z = np.load(cache_path)
     required = {"ev_grid", "la_grid", "grid", "spline_grid", "lgbm_grid",
                 "stretch_pm"}
@@ -66,7 +66,7 @@ def load_cached_grids() -> dict:
 
 
 def test_targets(test: pl.DataFrame, group_keys):
-    """Per-group test targets aligned to a group key — replaces what
+    """Per-group test targets aligned to a group key, replaces what
     `train_splines`/`train_lgbm` used to compute as a side effect.
 
     Returns (y_te, w_te, grp_te) where grp_te is keyed by `group_keys` with
@@ -98,7 +98,7 @@ MAX_CSV = "pitcher_pwobacon_plus_2020_26.csv"
 
 def load_max_pwobacon() -> pl.DataFrame:
     """Per (pitcher_id, year): Max pwOBAcon. CSV pitcher column is
-    "<mlbam_id><L|R>" — strip the handedness suffix to get pitcher_id.
+    "<mlbam_id><L|R>"; strip the handedness suffix to get pitcher_id.
     """
     df = pl.read_csv(RAW / MAX_CSV)
     return df.with_columns(
@@ -192,8 +192,8 @@ def fit_univariate(x_tr, y_tr, w_tr) -> tuple[float, float]:
 def load_pitcher_grain(min_ip: int = 30):
     """Pitcher-year grain: defers to eval.load_splits().
 
-    `alpha_bbe` is the full 2016-2025 BBE — every pitcher, every year, no IP
-    threshold or pair requirement — used for the chronological Cronbach's α
+    `alpha_bbe` is the full 2016-2025 BBE (every pitcher, every year, no IP
+    threshold or pair requirement) used for the chronological Cronbach's α
     accrual plot.
     """
     train, val, test, test_next = load_splits(min_ip=min_ip)
@@ -272,7 +272,7 @@ def per_bip_predictors(test: pl.DataFrame, grids: dict,
                        beta_pwobacon) -> dict[str, np.ndarray]:
     """For each leaderboard model, predict at the BIP level on `test` by
     bilinear-interpolating the cached (EV, LA) grids loaded from
-    `ensemble_grid.npz` — no model retraining.
+    `ensemble_grid.npz`; no model retraining.
     """
     evs = test["launch_speed"].to_numpy()
     las = test["launch_angle"].to_numpy()
@@ -577,9 +577,9 @@ def render_main_leaderboard_png(main_title: str, subtitle: str,
         cell_text.append([
             str(i + 1),
             _display_name(r["name"]),
-            "—" if not np.isfinite(r["rmse"])   else f"{r['rmse']:.4f}",
-            "—" if not np.isfinite(r["r"])      else f"{r['r']:.3f}",
-            "—" if not np.isfinite(r["r_self"]) else f"{r['r_self']:.3f}",
+            "-" if not np.isfinite(r["rmse"])   else f"{r['rmse']:.4f}",
+            "-" if not np.isfinite(r["r"])      else f"{r['r']:.3f}",
+            "-" if not np.isfinite(r["r_self"]) else f"{r['r_self']:.3f}",
         ])
         if r["name"].startswith("ensemble") or r["name"] == "xwobacon":
             bold_rows.add(i)
@@ -644,8 +644,8 @@ def render_top_bottom_png(main_title: str, subtitle: str, has_pt: bool,
                 r["pitcher_name"],
                 meta_fmt(r[meta_col]),
                 f"{r['n_bip']:d}",
-                "—" if pred is None or not np.isfinite(pred) else f"{pred:.4f}",
-                "—" if act  is None or not np.isfinite(act)  else f"{act:.4f}",
+                "-" if pred is None or not np.isfinite(pred) else f"{pred:.4f}",
+                "-" if act  is None or not np.isfinite(act)  else f"{act:.4f}",
             ])
         return rows
 
@@ -806,7 +806,7 @@ def run_grain(loader, grids: dict, out_filename: str,
         ok = np.isfinite(pred_n) & np.isfinite(pred_n1)
         rmse = weighted_rmse(y_te[ok], pred_n[ok], w_te[ok])
         if np.ptp(pred_n[ok]) == 0 or np.ptp(pred_n1[ok]) == 0:
-            r_val = rself = float("nan")  # constant predictor — corr undefined
+            r_val = rself = float("nan")  # constant predictor: corr undefined
         else:
             r_val = weighted_corr(pred_n[ok], y_te[ok], w_te[ok])
             rself = weighted_corr(pred_n[ok], pred_n1[ok], w_te[ok])
@@ -849,7 +849,7 @@ def run_grain(loader, grids: dict, out_filename: str,
     pst_te    = season_metrics(test,      group_keys)
     pst_te_n1 = season_metrics(test_next, self_keys)  # drop "year" for alignment
 
-    # PA-level rates + Max pwOBAcon — only at pitcher-year grain.
+    # PA-level rates + Max pwOBAcon, only at pitcher-year grain.
     metrics_iter = list(METRICS)
     if group_keys == ("pitcher_id", "year"):
         pa_rates = pitcher_season_pa_rates()
@@ -886,7 +886,7 @@ def run_grain(loader, grids: dict, out_filename: str,
         x_n1 = paired_n1[metric].to_numpy()
         if metric in PA_METRICS:
             # PA-level rates aren't in xwobacon units, so RMSE and
-            # corr(x, xwobacon) aren't meaningful — only self-stability is.
+            # corr(x, xwobacon) aren't meaningful, only self-stability is.
             rmse  = float("nan")
             r_val = float("nan")
         else:
@@ -927,7 +927,7 @@ def run_grain(loader, grids: dict, out_filename: str,
                         else f"IP ≥ {TOP_BOTTOM_MIN}")
         png_grain_label = ("Pitcher × Pitch Type" if has_pt else "Pitcher")
         yr_label = f"{TOP_BOTTOM_YEARS[0]}-{TOP_BOTTOM_YEARS[-1]}"
-        png_main_tb = f"Top / Bottom 20 — {png_grain_label}, {yr_label}"
+        png_main_tb = f"Top / Bottom 20 - {png_grain_label}, {yr_label}"
         png_sub_tb  = ("Ranked by ensemble (smoothed splines + LGBM) "
                        f"predicted xwobacon  ·  {thresh_label}")
         tb_png_path = art / top_bottom_png
@@ -940,7 +940,7 @@ def run_grain(loader, grids: dict, out_filename: str,
         print(f"saved {tb_png_path.name}", file=sys.stderr)
 
     if alpha_filename is not None:
-        # α plot has always omitted gam/lgbm/naive — show ensemble + the
+        # α plot has always omitted gam/lgbm/naive: show ensemble + the
         # univariate baselines + pwobacon. PA-level rates (K%/BB%/HR%) and
         # Max pwOBAcon are per-pitcher-year aggregates, not per-BIP, so
         # they can't be plotted on the BIP-accrual axis.
