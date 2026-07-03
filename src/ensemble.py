@@ -1,4 +1,4 @@
-"""Final pitcher-year predictive-xwOBAcon ensemble (Gaussian-smoothed + stretched).
+"""Final pitcher-year predictive-xwOBAcon ensemble (Gaussian-smoothed + per-group b(n) calibration).
 
 Two component models trained on per-event (EV, LA) with a custom group-
 aggregated MSE loss, grouped by (pitcher_id, year):

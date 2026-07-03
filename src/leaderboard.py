@@ -9,7 +9,8 @@ Columns (BIP-weighted on the held-out 2024 → 2025 test set):
 Rows: ensemble (smoothed 50/50 splines + LGBM — the production model
       defined in src/ensemble.py), gam, lgbm, pwobacon, xwobacon, avg_ev,
       avg_la, naive (constant training-mean target). At pitcher-year grain
-      only: K%, BB%, HR% (PA-level rates, shown for self-stability only).
+      only: pwOBAcon (Max); and K%, BB%, HR% (PA-level rates, shown for
+      self-stability only).
 
 Usage:
   uv run python src/leaderboard.py    # runs both grains, writes both artifacts

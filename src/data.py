@@ -6,6 +6,7 @@ xwoba_value (= Statcast estimated_woba_using_speedangle), event_type.
 
 `load_batted_balls`     — one row per BBE with EV/LA/xwoba_value.
 `pitcher_season_xwobacon` — per (pitcher_id, year): n_bip, xwobacon.
+`pitcher_season_pa_rates` — per (pitcher_id, year): n_pa, k_pct, bb_pct, hr_pct.
 `pitcher_season_ip`     — per (pitcher_id, year): outs, ip (approx).
 """
 from __future__ import annotations
