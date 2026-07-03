@@ -997,13 +997,13 @@ def render_calibration_scatter(grids: dict, out_path: Path,
 
     # Weighted OLS slope/intercept of actual on pred (for calibration line).
     w = n_bip
-    pm = (w * pred).sum() / w.sum()
+    pbar = (w * pred).sum() / w.sum()
     am = (w * actual).sum() / w.sum()
-    b = ((w * (pred - pm) * (actual - am)).sum()
-         / (w * (pred - pm) ** 2).sum())
-    a = am - b * pm
-    r = (((w * (pred - pm) * (actual - am)).sum())
-         / np.sqrt((w * (pred - pm) ** 2).sum()
+    b = ((w * (pred - pbar) * (actual - am)).sum()
+         / (w * (pred - pbar) ** 2).sum())
+    a = am - b * pbar
+    r = (((w * (pred - pbar) * (actual - am)).sum())
+         / np.sqrt((w * (pred - pbar) ** 2).sum()
                    * (w * (actual - am) ** 2).sum()))
 
     fig, ax = plt.subplots(figsize=(8.5, 7.0), constrained_layout=True)

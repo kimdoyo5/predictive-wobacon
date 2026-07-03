@@ -445,7 +445,7 @@ def main() -> int:
              spline_grid=spline_grid, lgbm_grid=lgbm_grid,
              sigma_ev=SMOOTH_SIGMA_EV, sigma_la=SMOOTH_SIGMA_LA,
              stretch_pm=stretch_pm)
-    print(f"\nsaved ensemble_grid.npz")
+    print("\nsaved ensemble_grid.npz")
 
     # Heatmaps: ensemble (= the smoothed model) + raw components.
     density_bbe = load_batted_balls()
