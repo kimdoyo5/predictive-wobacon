@@ -1,7 +1,5 @@
 # predictive-wobacon
 
-**Next-year pitcher contact quality from exit velocity and launch angle alone.**
-
 ## Quickstart
 
 ```bash
@@ -17,7 +15,7 @@ uv run python src/leaderboard.py     # score baselines + render charts (~1 min)
    - a GAM: 50×50 quantile-knot B-spline tensor product over (EV, LA) with a P-spline penalty, fit by weighted ridge on per-group mean basis activations; and
    - LightGBM, whose custom objective aggregates per-pitch predictions to per-group means before computing gradients.
 2. An ensemble grid: the 50/50 average on a 481×721 (EV, LA) mesh, Gaussian-smoothed (σ = 5 mph, 5°). This cached grid is the production model.
-3. Sample-size-aware calibration at prediction time (below).
+3. Sample-size-aware calibration at prediction time.
 
 Everything downstream reads the one cached grid (no retraining), so iterating on metrics and charts is cheap.
 
@@ -46,15 +44,6 @@ That even spread is deliberate. A boosting leaf that covers all $N_p$ balls of a
 $$-\frac{\sum_{e \in p} g_e}{\sum_{e \in p} h_e} = -\frac{2 w_p (m_p - y_p)}{2 w_p} = -(m_p - y_p),$$
 
 so the group mean lands exactly on its target. Because the per-ball Hessians sum back to the group curvature, $\sum_{e \in p} h_e = \partial^2 L/\partial m_p^2$, tree-wise Newton updates behave as if they optimized the per-pitcher means directly. (See `lgbm_aggregated_objective` in `src/ensemble.py`.)
-
-## The calibration trick
-
-Raw grid predictions are too compressed toward the league mean (calibration slope ≈ 2.3). But a pitcher's grid-average is a *noisy* estimate whose noise shrinks with sample size, so the right decompression grows with n:
-
-```
-b(n) = 1 + (b_max − 1) · n / (n + n₀)     # b_max = 10, n₀ = 8000
-pred = pm + b(n) · (raw − pm)             # pm = league pred mean
-```
 
 ## Results
 
