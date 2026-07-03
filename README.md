@@ -1,10 +1,10 @@
 # predictive-wobacon
 
-**Projecting a pitcher's next-year contact quality from exit velocity and launch angle alone.**
+**Next-year pitcher contact quality from exit velocity and launch angle alone.**
 
 `xwOBAcon` is expected wOBA on contact: Statcast's `estimated_woba_using_speedangle` averaged over a pitcher's batted balls. It predicts a pitcher's *next-year* xwOBAcon from only the exit velocity (EV) and launch angle (LA) of the contact they allowed *this* year.
 
-The whole model is one 2-D lookup surface over (EV, LA): score every batted ball, average per pitcher, done. No pitch type, count, spin, handedness, or identity. The only signal is *how a pitcher's contact is distributed in (EV, LA) space*.
+The whole model is one 2-D lookup surface over (EV, LA): score every batted ball, then average per pitcher. It uses no pitch type, count, spin, handedness, or identity; the only signal is how a pitcher's contact is distributed in (EV, LA) space.
 
 ## Quickstart
 
@@ -17,17 +17,17 @@ uv run python src/leaderboard.py     # score baselines + render charts (~1 min)
 
 ## How it works
 
-1. **Two component models**, fit at the `(pitcher, year)` level so a pitcher-season counts proportionally, not by batted-ball volume:
-   - a **GAM**: 50×50 quantile-knot B-spline tensor product over (EV, LA), P-spline penalty, fit by weighted ridge on per-group mean basis activations; and
-   - **LightGBM**: custom objective aggregating per-pitch predictions to per-group means *before* computing gradients.
-2. **Ensemble grid**: 50/50 average on a 481×721 (EV, LA) mesh, Gaussian-smoothed (σ = 5 mph, 5°). This cached grid *is* the production model.
-3. **Sample-size-aware calibration** at prediction time (below).
+1. Two component models, both fit at the `(pitcher, year)` level so a pitcher-season counts by its weight, not its batted-ball volume:
+   - a GAM: 50×50 quantile-knot B-spline tensor product over (EV, LA) with a P-spline penalty, fit by weighted ridge on per-group mean basis activations; and
+   - LightGBM, whose custom objective aggregates per-pitch predictions to per-group means before computing gradients.
+2. An ensemble grid: the 50/50 average on a 481×721 (EV, LA) mesh, Gaussian-smoothed (σ = 5 mph, 5°). This cached grid is the production model.
+3. Sample-size-aware calibration at prediction time (below).
 
 Everything downstream reads the one cached grid (no retraining), so iterating on metrics and charts is cheap.
 
 ## The group-aggregated objective
 
-LightGBM optimizes a sum of *per-sample* losses and wants a gradient and Hessian for each batted ball. But the target lives at the *group* level (a pitcher-season is scored by the **mean** of its per-ball predictions, not ball by ball), and weighting balls equally would let high-volume pitchers dominate the fit. So the loss is defined on group means and backpropagated to events.
+LightGBM optimizes a sum of *per-sample* losses and wants a gradient and Hessian for each batted ball. But the target lives at the *group* level (a pitcher-season is scored by the mean of its per-ball predictions, not ball by ball), and weighting balls equally would let high-volume pitchers dominate the fit. So the loss is defined on group means and backpropagated to events.
 
 Let ball $e$ belong to group $p$ (a pitcher-year) with $N_p$ balls, weight $w_p$, and next-year target $y_p$. LightGBM's raw output for a ball is $f_e$, and the group prediction is their mean:
 
@@ -41,15 +41,15 @@ Since $\partial m_p / \partial f_e = 1/N_p$, the chain rule gives the per-ball g
 
 $$g_e = \frac{\partial L}{\partial f_e} = \frac{\partial L}{\partial m_p}\cdot\frac{1}{N_p} = \frac{2 w_p (m_p - y_p)}{N_p} .$$
 
-For the Hessian we **spread the group curvature evenly** over its balls, rather than take the naive per-ball second derivative $\big(\partial^2 L/\partial f_e^2 = 2 w_p / N_p^2\big)$:
+For the Hessian we spread the group curvature evenly over its balls, rather than take the naive per-ball second derivative $\big(\partial^2 L/\partial f_e^2 = 2 w_p / N_p^2\big)$:
 
 $$h_e = \frac{1}{N_p}\frac{\partial^2 L}{\partial m_p^2} = \frac{2 w_p}{N_p} .$$
 
-This is the deliberate part. A boosting leaf that covers all $N_p$ balls of a group takes the Newton step
+That even spread is deliberate. A boosting leaf that covers all $N_p$ balls of a group takes the Newton step
 
 $$-\frac{\sum_{e \in p} g_e}{\sum_{e \in p} h_e} = -\frac{2 w_p (m_p - y_p)}{2 w_p} = -(m_p - y_p),$$
 
-moving the group mean exactly onto its target. Because the per-ball Hessians sum back to the group curvature, $\sum_{e \in p} h_e = \partial^2 L/\partial m_p^2$, tree-wise Newton updates behave as if they were optimizing the per-pitcher means directly. (See `lgbm_aggregated_objective` in `src/ensemble.py`.)
+so the group mean lands exactly on its target. Because the per-ball Hessians sum back to the group curvature, $\sum_{e \in p} h_e = \partial^2 L/\partial m_p^2$, tree-wise Newton updates behave as if they optimized the per-pitcher means directly. (See `lgbm_aggregated_objective` in `src/ensemble.py`.)
 
 ## The calibration trick
 
@@ -60,11 +60,11 @@ b(n) = 1 + (b_max − 1) · n / (n + n₀)     # b_max = 10, n₀ = 8000
 pred = pm + b(n) · (raw − pm)             # pm = league pred mean
 ```
 
-A single global stretch can't win everywhere: it over-corrects noisy season lines and under-corrects reliable career totals. `b(n)` decouples them: seasons (n ≈ 50–600) get b ≈ 1.1–1.6 (RMSE-optimal), career aggregates (n ≈ 1000–5000) get b ≈ 2.5–4.5, pulling career calibration from slope 1.78 to **1.01** with neutral-to-better season RMSE.
+A single global stretch can't win everywhere: it over-corrects noisy season lines and under-corrects reliable career totals. `b(n)` decouples them: seasons (n ≈ 50–600) get b ≈ 1.1–1.6 (RMSE-optimal), career aggregates (n ≈ 1000–5000) get b ≈ 2.5–4.5. Career calibration then goes from slope 1.78 to 1.01, with season RMSE neutral-to-better.
 
 ## Results
 
-Held out chronologically: train 2016–2023, test **2024 → predict 2025**, min(IP, IP_next) ≥ 30, min-of-pair weighted. Benchmarked against Tango's pwOBAcon, Max's pwOBAcon+, xwOBAcon carryover, a per-bucket OLS, and a naive constant.
+Held out chronologically: train 2016–2023, test 2024 → predict 2025, min(IP, IP_next) ≥ 30, min-of-pair weighted. Benchmarked against Tango's pwOBAcon, Max's pwOBAcon+, xwOBAcon carryover, a per-bucket OLS, and a naive constant.
 
 | Slice | RMSE | r | r (self) |
 |---|---|---|---|
