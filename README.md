@@ -2,10 +2,6 @@
 
 **Next-year pitcher contact quality from exit velocity and launch angle alone.**
 
-`xwOBAcon` is expected wOBA on contact: Statcast's `estimated_woba_using_speedangle` averaged over a pitcher's batted balls. It predicts a pitcher's *next-year* xwOBAcon from only the exit velocity (EV) and launch angle (LA) of the contact they allowed *this* year.
-
-The whole model is one 2-D lookup surface over (EV, LA): score every batted ball, then average per pitcher. It uses no pitch type, count, spin, handedness, or identity; the only signal is how a pitcher's contact is distributed in (EV, LA) space.
-
 ## Quickstart
 
 ```bash
@@ -25,7 +21,7 @@ uv run python src/leaderboard.py     # score baselines + render charts (~1 min)
 
 Everything downstream reads the one cached grid (no retraining), so iterating on metrics and charts is cheap.
 
-## The group-aggregated objective
+## Objective
 
 LightGBM optimizes a sum of *per-sample* losses and wants a gradient and Hessian for each batted ball. But the target lives at the *group* level (a pitcher-season is scored by the mean of its per-ball predictions, not ball by ball), and weighting balls equally would let high-volume pitchers dominate the fit. So the loss is defined on group means and backpropagated to events.
 
@@ -59,8 +55,6 @@ Raw grid predictions are too compressed toward the league mean (calibration slop
 b(n) = 1 + (b_max − 1) · n / (n + n₀)     # b_max = 10, n₀ = 8000
 pred = pm + b(n) · (raw − pm)             # pm = league pred mean
 ```
-
-A single global stretch can't win everywhere: it over-corrects noisy season lines and under-corrects reliable career totals. `b(n)` decouples them: seasons (n ≈ 50–600) get b ≈ 1.1–1.6 (RMSE-optimal), career aggregates (n ≈ 1000–5000) get b ≈ 2.5–4.5. Career calibration then goes from slope 1.78 to 1.01, with season RMSE neutral-to-better.
 
 ## Results
 
