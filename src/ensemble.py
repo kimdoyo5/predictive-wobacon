@@ -37,7 +37,7 @@ from sklearn.preprocessing import SplineTransformer
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 from data import load_batted_balls
-from eval import load_splits, weighted_rmse, weighted_r2
+from eval import weighted_rmse, weighted_r2
 
 ART = ROOT / "artifacts"
 
@@ -137,7 +137,6 @@ def weighted_ridge(X, y, w, alpha, P):
     Centering uses the weighted mean (not the sample mean of sqrt(w)·X) so
     the intercept is correct under heterogeneous weights.
     """
-    K = X.shape[1]
     W = w / w.sum()
     x_bar = W @ X
     y_bar = float(W @ y)
