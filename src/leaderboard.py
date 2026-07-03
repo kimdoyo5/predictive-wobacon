@@ -99,7 +99,7 @@ def load_max_pwobacon() -> pl.DataFrame:
     """Per (pitcher_id, year): Max pwOBAcon. CSV pitcher column is
     "<mlbam_id><L|R>" — strip the handedness suffix to get pitcher_id.
     """
-    df = pl.read_csv(ART / MAX_CSV)
+    df = pl.read_csv(RAW / MAX_CSV)
     return df.with_columns(
         pl.col("pitcher").str.replace(r"[LR]$", "").cast(pl.Int64).alias("pitcher_id"),
         pl.col("game_year").alias("year"),
