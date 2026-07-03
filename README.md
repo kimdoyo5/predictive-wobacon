@@ -2,7 +2,8 @@
 
 Per-pitch (exit velocity, launch angle) → next-year pitcher xwOBAcon. A
 50/50 GAM-spline + LightGBM ensemble on a dense (EV, LA) grid, Gaussian
-smoothed, post-hoc linear-stretched, then BIP-averaged per pitcher-year.
+smoothed, BIP-averaged per pitcher-year, then stretched by a
+sample-size-dependent calibration b(n).
 
 ## What this is
 
@@ -23,6 +24,11 @@ uv run python src/fetch_savant.py    # ~minutes per year, only needed once
 uv run python src/ensemble.py        # ~30s: train + cache the production grid
 uv run python src/leaderboard.py     # ~15s: render every PNG from the cache
 ```
+
+## Useful links
+https://tangotiger.com/index.php/site/comments/stacast-lab-xwobacon-v-predictive-wobacon
+https://tangotiger.com/index.php/site/comments/introducing-predictive-woba
+
 
 ## Install
 
@@ -53,7 +59,7 @@ with retry/backoff, one HTTP call per day.
 
 Trains two component models on per-event (EV, LA) with a custom
 group-aggregated MSE loss (grouped by `(pitcher_id, year)`), blends
-them, smooths, stretches, and caches.
+them, smooths, and caches.
 
 1. **Splits.** `eval.load_splits()` partitions chronologically into
    trainval (2016–2023) and test (2024 → predicting 2025). Training
@@ -69,13 +75,16 @@ them, smooths, stretches, and caches.
    1. Evaluate both models on a 481×721 (EV, LA) mesh (0.25 mph × 0.25°).
    2. `ens = 0.5 * spline_grid + 0.5 * lgbm_grid`.
    3. Gaussian smooth at `σ = (5 mph, 5°)`.
-   4. Mean-preserving linear stretch by `b = LINEAR_STRETCH_B = 1.3`
-      around the trainval per-group pred mean.
+
+   The calibration stretch is NOT baked into the grid. Production
+   predictions (`calibrated_grid_predict_per_group`) average the grid
+   per BIP, then stretch each group's mean by
+   `b(n) = 1 + (STRETCH_B_MAX − 1) · n / (n + STRETCH_N0)` around the
+   trainval pred mean `pm`, where `n` is the group's BIP count.
 
 - **Writes** `artifacts/ensemble_grid.npz`: production grid (`grid`),
   un-smoothed `spline_grid` / `lgbm_grid`, shared `ev_grid` / `la_grid`,
-  and stretch provenance (`stretch_b`, `stretch_pm`, `stretch_a`). Also
-  three heatmap PNGs.
+  and the stretch center (`stretch_pm`). Also three heatmap PNGs.
 
 ### 3. `src/leaderboard.py`
 
@@ -127,38 +136,54 @@ All in `src/ensemble.py`:
 | `LGBM_NUM_BOOST_ROUND` | 3000 | LightGBM boosting rounds |
 | `GRID_N_EV` × `GRID_N_LA` | 481 × 721 | Grid resolution (0.25 mph × 0.25°) |
 | `SMOOTH_SIGMA_EV` / `SMOOTH_SIGMA_LA` | 5.0 / 5.0 | Gaussian smoothing σ |
-| `LINEAR_STRETCH_B` | 1.3 | Post-hoc calibration stretch around trainval pred mean |
+| `STRETCH_B_MAX` / `STRETCH_N0` | 10.0 / 8000 | Sample-size-dependent calibration stretch b(n) |
 
 ### Environment overrides
 
-- `SCALE_B=<float>` — override `LINEAR_STRETCH_B` for one run. `SCALE_B=1.0`
-  disables the stretch (useful for ablation).
 - `MIN_BIP_TRAINVAL=<int>` — override the training filter (set internally
   to `50` by both entrypoints, honored by `eval.load_splits`).
 
-## On the calibration stretch (b=1.3)
+## On the calibration stretch b(n)
 
-The unscaled smoothed grid produces per-pitcher predictions that are
-~3× too compressed around the league mean vs the actuals (slope of
-weighted OLS on the career calibration plot ≈ 2.3). We can't recover
-that full slope without breaking RMSE — pitcher skill is noisy
-year-over-year, so over-stretching predictions actively hurts
-predictive RMSE on the noisier slices.
+The raw smoothed grid produces per-pitcher predictions that are far too
+compressed around the league mean: weighted OLS of actual on pred on the
+career calibration plot has slope ≈ 2.3. A group's grid-average is a
+noisy estimate of its true contact-quality distribution, and that noise
+shrinks with sample size, so the optimal decompression is
+sample-size-dependent:
 
-`b = 1.3` was chosen by sweeping `b ∈ {1.0, 1.1, ..., 2.0}` against all
-four leaderboard slices and picking the largest `b` that doesn't
-regress the 20-threshold cuts. Result vs unscaled baseline:
+```
+b(n) = 1 + (STRETCH_B_MAX − 1) · n / (n + STRETCH_N0)
+pred = pm + b(n) · (raw − pm)
+```
 
-| Slice | RMSE Δ |
-|---|---|
-| bip100 | **−1.9%** |
-| ip100 | **−0.9%** |
-| bip20 | −0.2% |
-| ip20 | +0.2% (essentially tied) |
+with `n` the group's BIP count and `pm` the trainval pred mean. A single
+global `b` (the old `b = 1.3`) over-stretches noisy small-n groups and
+under-stretches reliable large-n ones — it could only reach career slope
+1.78 before regressing season-level RMSE. Because career aggregates
+(n ≈ 1000–5000) are much larger than season groups (n ≈ 50–600), b(n)
+decouples the two: season groups get the RMSE-optimal b ≈ 1.1–1.6 while
+career aggregates get b ≈ 2.5–4.5, reaching 1:1 career calibration.
 
-R² and R²(self) are mathematically invariant under linear stretch, so
-this is a pure RMSE-side fix — it does not lift the model's signal
-ceiling.
+`(b_max, n0) = (10, 8000)` — near-linear in n over the observed range —
+was chosen by sweeping both parameters against the four leaderboard
+slices plus the career calibration slope. Result vs the old global
+`b = 1.3`:
+
+| Slice | RMSE Δ | r Δ | r(self) Δ |
+|---|---|---|---|
+| bip20 | −0.2% | +0.004 | +0.022 |
+| bip100 | +0.5% | −0.001 | +0.005 |
+| ip20 | −0.4% | +0.010 | +0.039 |
+| ip100 | +0.2% | +0.001 | +0.008 |
+| career calibration slope | 1.78 → **1.01** | | |
+
+Unlike a global linear stretch (which leaves r / r(self) invariant),
+b(n) shrinks noisy groups relative to reliable ones, which is why the
+correlations move — consistently up on the noisy 20-threshold cuts.
+One trade-off: the career-scatter correlation itself drops (r² 0.54 →
+0.44) because the career plot partly reflects concurrent (same-season)
+fit, which no next-year-calibrated stretch can recover.
 
 ## Module layout
 
@@ -167,7 +192,7 @@ src/
   data.py          # parquet loaders, OUTS_PER_EVENT, BBE filtering
   eval.py          # load_splits, weighted_rmse / weighted_r2 / weighted_corr
   fetch_savant.py  # baseballsavant scraper (network)
-  ensemble.py      # train + smoothed + stretched grid, save npz
+  ensemble.py      # train + smoothed grid + b(n) calibration, save npz
   leaderboard.py   # read npz, score baselines, render every PNG
 artifacts/         # all generated outputs land here
 data/raw/          # pitches_{year}.parquet and pitcher_names.parquet

@@ -7,19 +7,18 @@ aggregated MSE loss, grouped by (pitcher_id, year):
   2. LGBM: 3000 rounds, num_leaves=5, min_data_in_leaf=1000.
 
 Their 50/50 average is evaluated on a dense 481×721 (EV, LA) grid (0.25
-mph × 0.25°), then Gaussian-smoothed at σ=(5 mph, 5°), then linearly
-stretched by b=LINEAR_STRETCH_B around the trainval per-group pred mean
-(mean-preserving calibration). The stretched smoothed grid is THE
-production ensemble: per-group predictions = bilinear interpolation per
-BIP, averaged per group.
+mph × 0.25°), then Gaussian-smoothed at σ=(5 mph, 5°). That smoothed grid
+plus a sample-size-dependent calibration stretch is THE production
+ensemble: per-group predictions = bilinear interpolation per BIP,
+averaged per group, then stretched by b(n_bip) around the trainval pred
+mean (see STRETCH_B_MAX / STRETCH_N0 / calibrated_grid_predict_per_group).
 
 Filters and weights: see eval.load_splits (this module overrides
 MIN_BIP_TRAINVAL=50 for training; trainval = train ∪ val with no val
 held out).
 
 Usage:
-  uv run python src/ensemble.py            # baked-in stretch (b=LINEAR_STRETCH_B)
-  SCALE_B=1.0 uv run python src/ensemble.py    # override / disable stretch
+  uv run python src/ensemble.py
 """
 from __future__ import annotations
 
@@ -54,13 +53,22 @@ GRID_N_LA = 721         # -90..90 deg at 0.25°
 SMOOTH_SIGMA_EV = 5.0   # mph
 SMOOTH_SIGMA_LA = 5.0   # degrees
 
-# Post-hoc linear stretch around the trainval pred mean. Set by sweeping
-# b ∈ {1.0, 1.1, ..., 2.0} against the four leaderboard slices and picking
-# the largest b that doesn't regress the 20-threshold cuts. RMSE wins:
-# bip100 -1.9%, ip100 -0.9%, bip20 -0.2%, ip20 +0.2% (essentially tied).
-# R² and R²(self) are mathematically invariant under linear stretch, so
-# this is RMSE-only — it doesn't lift the model's signal ceiling.
-LINEAR_STRETCH_B = 1.3
+# Post-hoc sample-size-dependent stretch around the trainval pred mean:
+#   b(n) = 1 + (STRETCH_B_MAX - 1) * n / (n + STRETCH_N0)
+# where n is the group's BIP count in the data being aggregated. A group's
+# grid-average is an estimate whose sampling noise shrinks with n, so the
+# optimal stretch grows with n — a single global b (the old b=1.3)
+# over-stretches noisy small-n groups and under-stretches reliable
+# large-n ones (career calibration slope was 1.78, i.e. still ~2x too
+# compressed). With n0 >> typical season n the curve is near-linear in n
+# over the observed range (b≈1.4 at a 400-BIP season, b≈3.5 at a
+# 3000-BIP career), which is what lets season-level RMSE stay optimal
+# while career-level calibration reaches 1:1. Values set by sweeping
+# (b_max, n0) against the four leaderboard slices + the career
+# calibration slope (see README): slope 1.78 → 1.01, RMSE ~neutral,
+# r/r_self up on the noisy slices.
+STRETCH_B_MAX = 10.0
+STRETCH_N0    = 8000.0
 
 # Default group key used by all model-training functions. Override via
 # `group_keys=("pitcher_id", "pitch_type", "year")` for the pitch-type grain.
@@ -233,17 +241,16 @@ def _component_grids(s, l):
 
 def build_smoothed_ensemble_grid(s, l, train_full: pl.DataFrame,
                                    sigma_ev: float = SMOOTH_SIGMA_EV,
-                                   sigma_la: float = SMOOTH_SIGMA_LA,
-                                   stretch_b: float = LINEAR_STRETCH_B):
+                                   sigma_la: float = SMOOTH_SIGMA_LA):
     """Production ensemble grid: 0.5*spline + 0.5*LGBM on (EV, LA),
-    Gauss-smoothed at σ=(sigma_ev, sigma_la), then mean-preserving
-    linear stretch by `stretch_b` around the trainval per-group pred
-    mean. Override the stretch via env var SCALE_B (1.0 disables).
+    Gauss-smoothed at σ=(sigma_ev, sigma_la). The calibration stretch is
+    NOT baked into the grid — it is sample-size-dependent, so it is
+    applied per group at prediction time (see stretch_b /
+    calibrated_grid_predict_per_group).
 
-    Returns (ev_grid, la_grid, production_grid, stretch_meta) where
-    `stretch_meta = (b, pm, a)` records the applied calibration so it
-    can be saved alongside the npz for provenance. `(1.0, nan, 0.0)`
-    when no stretch was applied.
+    Returns (ev_grid, la_grid, production_grid, pm) where `pm` is the
+    trainval per-group pred weighted mean — the center every stretch
+    pivots around, saved alongside the npz.
     """
     ev_grid, la_grid, spline_grid, lgbm_grid = _component_grids(s, l)
     ens_grid = 0.5 * spline_grid + 0.5 * lgbm_grid
@@ -253,10 +260,6 @@ def build_smoothed_ensemble_grid(s, l, train_full: pl.DataFrame,
                                 sigma=(sigma_ev / dev, sigma_la / dla),
                                 mode="nearest")
 
-    b = float(os.environ.get("SCALE_B", stretch_b))
-    if b == 1.0:
-        return ev_grid, la_grid, smoothed, (1.0, float("nan"), 0.0)
-
     grp_trv = (train_full.sort(*PITCHER_YEAR_KEYS)
                    .group_by(list(PITCHER_YEAR_KEYS), maintain_order=True)
                    .agg(pl.col("n_bip_next").first()
@@ -265,10 +268,8 @@ def build_smoothed_ensemble_grid(s, l, train_full: pl.DataFrame,
     pred_trv = grid_predict_per_group(train_full, smoothed, ev_grid, la_grid,
                                         PITCHER_YEAR_KEYS, grp_trv)
     pm = float((w_trv * pred_trv).sum() / w_trv.sum())
-    a = pm * (1.0 - b)
-    print(f"  stretch b={b:.4f} around pm={pm:.5f}: a={a:+.5f}")
-    smoothed = a + b * smoothed
-    return ev_grid, la_grid, smoothed, (b, pm, a)
+    print(f"  stretch center pm={pm:.5f}")
+    return ev_grid, la_grid, smoothed, pm
 
 
 def grid_predict_per_bip(grid: np.ndarray, ev_grid: np.ndarray,
@@ -293,6 +294,30 @@ def grid_predict_per_group(bbe: pl.DataFrame, grid: np.ndarray,
     agg = df.group_by(list(group_keys)).agg(pl.col("p_e").mean().alias("p"))
     return (grp_te.select(list(group_keys))
                    .join(agg, on=list(group_keys), how="left")["p"].to_numpy())
+
+
+def stretch_b(n: np.ndarray) -> np.ndarray:
+    """Sample-size-dependent stretch factor: 1 at n=0 → STRETCH_B_MAX as n→∞."""
+    return 1.0 + (STRETCH_B_MAX - 1.0) * n / (n + STRETCH_N0)
+
+
+def calibrated_grid_predict_per_group(bbe: pl.DataFrame, grid: np.ndarray,
+                                       ev_grid: np.ndarray, la_grid: np.ndarray,
+                                       group_keys, grp_te: pl.DataFrame,
+                                       pm: float) -> np.ndarray:
+    """Production prediction: per-group `grid` mean, stretched by b(n_bip)
+    around the trainval pred mean `pm` (n_bip = the group's BIP count in
+    the data being predicted)."""
+    p_e = grid_predict_per_bip(grid, ev_grid, la_grid,
+                                bbe["launch_speed"].to_numpy(),
+                                bbe["launch_angle"].to_numpy())
+    df = bbe.with_columns(pl.Series("p_e", p_e))
+    agg = df.group_by(list(group_keys)).agg(pl.col("p_e").mean().alias("p"),
+                                             pl.len().alias("n_bip"))
+    joined = grp_te.select(list(group_keys)).join(agg, on=list(group_keys), how="left")
+    raw = joined["p"].to_numpy()
+    n   = joined["n_bip"].to_numpy().astype(np.float64)
+    return pm + stretch_b(n) * (raw - pm)
 
 
 # ---------- Heatmap ----------
@@ -386,13 +411,15 @@ def main() -> int:
 
     print(f"\n=== Ensemble = Gauss(0.5*spline + 0.5*LGBM), "
           f"σ=({SMOOTH_SIGMA_EV:g} mph, {SMOOTH_SIGMA_LA:g}°), "
-          f"stretch b={LINEAR_STRETCH_B:g} on {GRID_N_EV}×{GRID_N_LA} grid ===")
+          f"stretch b(n): b_max={STRETCH_B_MAX:g}, n0={STRETCH_N0:g} "
+          f"on {GRID_N_EV}×{GRID_N_LA} grid ===")
     t = time.time()
-    ev_grid, la_grid, smoothed_grid, (stretch_b, stretch_pm, stretch_a) = (
+    ev_grid, la_grid, smoothed_grid, stretch_pm = (
         build_smoothed_ensemble_grid(s, l, train_full))
 
-    pred_ens = grid_predict_per_group(test, smoothed_grid, ev_grid, la_grid,
-                                        PITCHER_YEAR_KEYS, s["grp_te"])
+    pred_ens = calibrated_grid_predict_per_group(
+        test, smoothed_grid, ev_grid, la_grid,
+        PITCHER_YEAR_KEYS, s["grp_te"], stretch_pm)
     rmse_e = weighted_rmse(s["y_te"], pred_ens, s["w_te"])
     r2_e = weighted_r2(s["y_te"], pred_ens, s["w_te"])
     print(f"  METRIC ensemble_test_rmse={rmse_e:.5f}")
@@ -408,16 +435,16 @@ def main() -> int:
     # rows from cached grids instead of retraining.
     _, _, spline_grid, lgbm_grid = _component_grids(s, l)
 
-    # Save the production model: smoothed + stretched ensemble + un-smoothed
-    # component grids on the shared (EV, LA) axes. Stretch provenance is
-    # recorded so downstream consumers / future debug can recover what was
-    # applied (b=1.0 with stretch_pm=NaN ⇒ no stretch).
+    # Save the production model: smoothed (un-stretched) ensemble + un-smoothed
+    # component grids on the shared (EV, LA) axes. The stretch is applied per
+    # group at prediction time; `stretch_pm` is its data-derived center —
+    # b_max/n0 live in code (STRETCH_B_MAX / STRETCH_N0).
     np.savez(ART / "ensemble_grid.npz",
              ev_grid=ev_grid, la_grid=la_grid,
              grid=smoothed_grid,
              spline_grid=spline_grid, lgbm_grid=lgbm_grid,
              sigma_ev=SMOOTH_SIGMA_EV, sigma_la=SMOOTH_SIGMA_LA,
-             stretch_b=stretch_b, stretch_pm=stretch_pm, stretch_a=stretch_a)
+             stretch_pm=stretch_pm)
     print(f"\nsaved ensemble_grid.npz")
 
     # Heatmaps: ensemble (= the smoothed model) + raw components.

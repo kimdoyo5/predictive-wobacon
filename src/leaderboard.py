@@ -29,6 +29,7 @@ os.environ.setdefault("MIN_BIP_TRAINVAL", "50")
 import importlib, eval as eval_mod; importlib.reload(eval_mod)
 from eval import load_splits, weighted_rmse, weighted_corr, TEST_N_YEAR
 from ensemble import (grid_predict_per_bip, grid_predict_per_group,
+                       calibrated_grid_predict_per_group, stretch_b,
                        SMOOTH_SIGMA_EV, SMOOTH_SIGMA_LA)
 from data import load_batted_balls, pitcher_season_ip, pitcher_season_pa_rates
 
@@ -46,7 +47,8 @@ def load_cached_grids() -> dict:
         raise FileNotFoundError(
             f"{cache_path} not found — run `uv run python src/ensemble.py` first.")
     z = np.load(cache_path)
-    required = {"ev_grid", "la_grid", "grid", "spline_grid", "lgbm_grid"}
+    required = {"ev_grid", "la_grid", "grid", "spline_grid", "lgbm_grid",
+                "stretch_pm"}
     missing = required - set(z.files)
     if missing:
         raise RuntimeError(
@@ -58,6 +60,7 @@ def load_cached_grids() -> dict:
         "smoothed_grid": z["grid"],
         "spline_grid":   z["spline_grid"],
         "lgbm_grid":     z["lgbm_grid"],
+        "pm":            float(z["stretch_pm"]),
     }
 
 
@@ -85,6 +88,23 @@ PT_TEST_YEAR = 2024
 METRICS = ["xwobacon", "avg_ev", "avg_la"]
 # PA-level rates (per plate appearance). Only meaningful at pitcher-year grain.
 PA_METRICS = ["k_pct", "bb_pct", "hr_pct"]
+# Per-pitcher-year metrics loaded from the Max pwOBAcon+ CSV. Same units as
+# xwobacon (predicted wOBA on contact), so they compete on RMSE / xwOBAcon.
+# Only meaningful at pitcher-year grain (CSV is keyed at that grain).
+MAX_METRICS = ["pwobacon_max"]
+MAX_CSV = "pitcher_pwobacon_plus_2020_26.csv"
+
+
+def load_max_pwobacon() -> pl.DataFrame:
+    """Per (pitcher_id, year): Max pwOBAcon. CSV pitcher column is
+    "<mlbam_id><L|R>" — strip the handedness suffix to get pitcher_id.
+    """
+    df = pl.read_csv(ART / MAX_CSV)
+    return df.with_columns(
+        pl.col("pitcher").str.replace(r"[LR]$", "").cast(pl.Int64).alias("pitcher_id"),
+        pl.col("game_year").alias("year"),
+        pl.col("pwobacon").alias("pwobacon_max"),
+    ).select("pitcher_id", "year", "pwobacon_max")
 
 
 # --- pwobacon 12-bucket OLS (3 LA × 4 EV) ---
@@ -406,6 +426,10 @@ def render_career_top_bottom_png(grids: dict, group_keys, out_path: Path,
         pl.col("p_ens").mean().alias("pred_xwobacon"),
         pl.col("xwoba_value").mean().alias("xwobacon_actual"),
     )
+    pm = grids["pm"]
+    n_career = agg["n_bip"].to_numpy().astype(np.float64)
+    agg = agg.with_columns(pl.Series(
+        "pred_xwobacon", pm + stretch_b(n_career) * (agg["pred_xwobacon"].to_numpy() - pm)))
 
     if has_pt:
         agg = agg.filter(pl.col("n_bip") >= TOP_BOTTOM_MIN)
@@ -445,8 +469,9 @@ def _display_name(name: str) -> str:
         "ensemble": "Ensemble",
         "lgbm":     "LightGBM",
         "gam":      "GAM",
-        "tango":    "pwOBAcon (Tango)",
-        "pwobacon": "pwOBAcon (Tango)",
+        "tango":           "pwOBAcon (Tango)",
+        "pwobacon":        "pwOBAcon (Tango)",
+        "pwobacon_max":    "pwOBAcon (Max)",
         "xwobacon": "xwOBAcon",
         "avg_ev":   "Avg EV",
         "avg_la":   "Avg LA",
@@ -767,7 +792,13 @@ def run_grain(loader, grids: dict, out_filename: str,
 
     pred_gam,  pred_gam_n1  = predict_n(grids["spline_grid"]),  predict_n1(grids["spline_grid"])
     pred_lgbm, pred_lgbm_n1 = predict_n(grids["lgbm_grid"]),    predict_n1(grids["lgbm_grid"])
-    pred_ens,  pred_ens_n1  = predict_n(grids["smoothed_grid"]), predict_n1(grids["smoothed_grid"])
+    # Production ensemble: smoothed grid + b(n_bip) calibration stretch.
+    pred_ens    = calibrated_grid_predict_per_group(
+        test, grids["smoothed_grid"], grids["ev_grid"], grids["la_grid"],
+        group_keys, grp_te, grids["pm"])
+    pred_ens_n1 = calibrated_grid_predict_per_group(
+        test_next, grids["smoothed_grid"], grids["ev_grid"], grids["la_grid"],
+        self_keys, grp_te, grids["pm"])
 
     rows: list[dict] = []
     def add(name, pred_n, pred_n1):
@@ -817,7 +848,7 @@ def run_grain(loader, grids: dict, out_filename: str,
     pst_te    = season_metrics(test,      group_keys)
     pst_te_n1 = season_metrics(test_next, self_keys)  # drop "year" for alignment
 
-    # PA-level baselines (K%, BB%, HR%) — only at pitcher-year grain.
+    # PA-level rates + Max pwOBAcon — only at pitcher-year grain.
     metrics_iter = list(METRICS)
     if group_keys == ("pitcher_id", "year"):
         pa_rates = pitcher_season_pa_rates()
@@ -828,6 +859,15 @@ def run_grain(loader, grids: dict, out_filename: str,
         pst_te    = pst_te.join(pa_n,    on=["pitcher_id", "year"], how="left")
         pst_te_n1 = pst_te_n1.join(pa_n1, on=["pitcher_id"], how="left")
         metrics_iter.extend(PA_METRICS)
+
+        max_pw = load_max_pwobacon()
+        mx_n  = max_pw.select(["pitcher_id", "year", *MAX_METRICS])
+        mx_n1 = (max_pw.filter(pl.col("year") == TEST_N_YEAR + 1)
+                        .select(["pitcher_id", *MAX_METRICS]))
+        pst_trv   = pst_trv.join(mx_n,   on=["pitcher_id", "year"], how="left")
+        pst_te    = pst_te.join(mx_n,    on=["pitcher_id", "year"], how="left")
+        pst_te_n1 = pst_te_n1.join(mx_n1, on=["pitcher_id"], how="left")
+        metrics_iter.extend(MAX_METRICS)
 
     y_trv = pst_trv["xwobacon_next"].to_numpy()
     w_trv = pst_trv["n_bip_next"].to_numpy().astype(np.float64)
@@ -850,7 +890,8 @@ def run_grain(loader, grids: dict, out_filename: str,
             r_val = float("nan")
         else:
             x_trv = pst_trv[metric].to_numpy()
-            a, b = fit_univariate(x_trv, y_trv, w_trv)
+            f_trv = np.isfinite(x_trv) & np.isfinite(y_trv) & np.isfinite(w_trv)
+            a, b = fit_univariate(x_trv[f_trv], y_trv[f_trv], w_trv[f_trv])
             yhat_n = a + b * x_n
             ok_y   = np.isfinite(yhat_n) & np.isfinite(x_n1)
             rmse   = weighted_rmse(y_te[ok_y], yhat_n[ok_y], w_te[ok_y])
@@ -899,9 +940,10 @@ def run_grain(loader, grids: dict, out_filename: str,
 
     if alpha_filename is not None:
         # α plot has always omitted gam/lgbm/naive — show ensemble + the
-        # univariate baselines + pwobacon. PA-level rates (K%/BB%/HR%) are
-        # per-PA, not per-BIP, so they can't be plotted on the BIP-accrual axis.
-        alpha_skip = {"gam", "lgbm", "naive", *PA_METRICS}
+        # univariate baselines + pwobacon. PA-level rates (K%/BB%/HR%) and
+        # Max pwOBAcon are per-pitcher-year aggregates, not per-BIP, so
+        # they can't be plotted on the BIP-accrual axis.
+        alpha_skip = {"gam", "lgbm", "naive", *PA_METRICS, *MAX_METRICS}
         render_alpha_plot(
             alpha_bbe, self_keys, grids, beta_pwobacon,
             ordered_names=[r["name"] for r in rows
@@ -947,9 +989,10 @@ def render_calibration_scatter(grids: dict, out_path: Path,
                    pl.col("xwoba_value").mean().alias("actual"))
               .filter(pl.col("n_bip") >= min_bip))
 
-    pred  = agg["pred"].to_numpy()
-    actual = agg["actual"].to_numpy()
+    pm = grids["pm"]
     n_bip = agg["n_bip"].to_numpy().astype(np.float64)
+    pred  = pm + stretch_b(n_bip) * (agg["pred"].to_numpy() - pm)
+    actual = agg["actual"].to_numpy()
 
     # Weighted OLS slope/intercept of actual on pred (for calibration line).
     w = n_bip
